@@ -102,20 +102,33 @@ async def handle_tools_list_request(message: dict, project_id: UUID, db) -> JSON
         # 서버별 도구 로딩 태스크 생성
         server_tasks = []
         for server_record in project_servers:
+            # SSE 서버와 stdio 서버 구분하여 설정 구성
             server_config = {
-                "command": server_record.command,
-                "args": server_record.args or [],
-                "env": server_record.env or {},
                 "timeout": server_record.timeout,
-                "is_enabled": server_record.is_enabled
+                "is_enabled": server_record.is_enabled,
+                "transport_type": server_record.transport_type
             }
+            
+            if server_record.is_sse_server():
+                # SSE 서버 설정
+                server_config.update({
+                    "url": server_record.url,
+                    "headers": server_record.headers or {},
+                })
+            else:
+                # stdio 서버 설정
+                server_config.update({
+                    "command": server_record.command,
+                    "args": server_record.args or [],
+                    "env": server_record.env or {},
+                })
             
             # Session manager가 기대하는 server_id 형식: "project_id.server_name"
             session_manager_server_id = f"{project_id}.{server_record.name}"
             logger.info(f"🔍 Unified routes - server: {server_record.name}, session_id: {session_manager_server_id}")
             
             task = asyncio.create_task(
-                mcp_connection_service.get_server_tools(session_manager_server_id, server_config)
+                mcp_connection_service.get_server_tools(session_manager_server_id, server_config, project_id=str(project_id))
             )
             server_tasks.append((server_record, task))
         
@@ -208,12 +221,24 @@ async def handle_tools_call_request(message: dict, project_id: UUID, db) -> JSON
         
         # 서버 설정 구성
         server_config = {
-            "command": target_server.command,
-            "args": target_server.args or [],
-            "env": target_server.env or {},
             "timeout": target_server.timeout or 30,
-            "is_enabled": target_server.is_enabled
+            "is_enabled": target_server.is_enabled,
+            "transport_type": target_server.transport_type
         }
+        
+        if target_server.is_sse_server():
+            # SSE 서버 설정
+            server_config.update({
+                "url": target_server.url,
+                "headers": target_server.headers or {},
+            })
+        else:
+            # stdio 서버 설정
+            server_config.update({
+                "command": target_server.command,
+                "args": target_server.args or [],
+                "env": target_server.env or {},
+            })
         
         # 도구 호출
         from ....services.mcp_connection_service import mcp_connection_service
@@ -222,7 +247,8 @@ async def handle_tools_call_request(message: dict, project_id: UUID, db) -> JSON
             str(target_server.id),
             server_config,
             actual_tool_name,
-            arguments
+            arguments,
+            project_id=str(project_id)
         )
         
         # 응답 형식 변환
