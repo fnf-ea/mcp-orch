@@ -738,6 +738,17 @@ async def delete_project_server(
     
     server_name = server.name
     
+    # 관련된 client_sessions 먼저 삭제 (Foreign Key 제약 조건 해결)
+    from ...models import ClientSession
+    client_sessions = db.query(ClientSession).filter(
+        ClientSession.server_id == server_id
+    ).all()
+    
+    if client_sessions:
+        logger.info(f"🧹 Cleaning up {len(client_sessions)} client sessions for server {server_name}")
+        for session in client_sessions:
+            db.delete(session)
+    
     # 서버 삭제
     db.delete(server)
     db.commit()
