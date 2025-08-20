@@ -123,9 +123,9 @@ async def handle_tools_list_request(message: dict, project_id: UUID, db) -> JSON
                     "env": server_record.env or {},
                 })
             
-            # Session manager가 기대하는 server_id 형식: "project_id.server_name"
-            session_manager_server_id = f"{project_id}.{server_record.name}"
-            logger.info(f"🔍 Unified routes - server: {server_record.name}, session_id: {session_manager_server_id}")
+            # Session manager가 기대하는 server_id 형식: server UUID
+            session_manager_server_id = str(server_record.id)
+            logger.info(f"🔍 Unified routes - server: {server_record.name}, server_id: {session_manager_server_id}")
             
             task = asyncio.create_task(
                 mcp_connection_service.get_server_tools(session_manager_server_id, server_config, project_id=str(project_id))
