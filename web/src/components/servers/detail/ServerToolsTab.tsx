@@ -45,7 +45,15 @@ export function ServerToolsTab({
       if (response.ok) {
         const data = await response.json();
         console.log('서버 상세 정보:', data);
-        setTools(data.tools || []);
+        
+        // 도구 스키마 필드 변환 (stdio와 SSE 호환성을 위해)
+        const transformedTools = (data.tools || []).map((tool: any) => ({
+          ...tool,
+          schema: tool.inputSchema || tool.schema // inputSchema를 schema로 매핑
+        }));
+        
+        console.log('🔧 ServerToolsTab - Transformed tools:', transformedTools);
+        setTools(transformedTools);
       } else {
         console.error('서버 상세 정보 로드 실패:', response.status);
         setTools([]);

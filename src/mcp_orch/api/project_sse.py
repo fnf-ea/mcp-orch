@@ -179,7 +179,7 @@ async def list_project_servers(
     current_user: User = Depends(get_current_user_for_project_sse),
     db: Session = Depends(get_db)
 ):
-    """프로젝트의 MCP 서버 목록 조회"""
+    """프로젝트의 MCP 서버 목록 조회 (stdio 및 SSE 모두 지원)"""
     
     # 프로젝트 접근 권한 확인
     await _verify_project_access(project_id, current_user, db)
@@ -191,17 +191,35 @@ async def list_project_servers(
     
     result = []
     for server in servers:
-        result.append({
+        server_data = {
             "id": str(server.id),
             "name": server.name,
-            "command": server.command,
-            "args": server.args,
-            "env": server.env,
+            "transport_type": server.transport_type,
+            "timeout": server.timeout,
+            "auto_approve": server.auto_approve,
             "disabled": not server.is_enabled,
             "status": server.status.value if server.status else "unknown",
             "created_at": server.created_at.isoformat() if server.created_at else None,
             "updated_at": server.updated_at.isoformat() if server.updated_at else None
-        })
+        }
+        
+        if server.is_sse_server():
+            # SSE 서버 정보
+            server_data.update({
+                "url": server.url,
+                "headers_count": len(server.headers),
+                "has_custom_headers": bool(server.headers)
+            })
+        else:
+            # stdio 서버 정보
+            server_data.update({
+                "command": server.command,
+                "args": server.args,
+                "env_vars_count": len(server.env),
+                "has_custom_env": bool(server.env)
+            })
+        
+        result.append(server_data)
     
     return result
 
@@ -213,7 +231,7 @@ async def add_project_server(
     current_user: User = Depends(get_current_user_for_project_sse),
     db: Session = Depends(get_db)
 ):
-    """프로젝트에 MCP 서버 추가 (Owner/Developer만 가능)"""
+    """프로젝트에 MCP 서버 추가 (stdio 및 SSE 모두 지원)"""
     
     # 프로젝트 접근 권한 확인 (Owner/Developer)
     project_member = db.query(ProjectMember).filter(
@@ -244,33 +262,96 @@ async def add_project_server(
             detail="Server name already exists in this project"
         )
     
+    # 전송 타입 확인 및 검증
+    transport_type = server_data.get("type", server_data.get("transport_type", "stdio"))
+    
+    # 서버 기본 설정
+    server_config = {
+        "project_id": project_id,
+        "name": server_data.get("name"),
+        "description": server_data.get("description"),
+        "transport_type": transport_type,
+        "timeout": server_data.get("timeout", 60),
+        "auto_approve": server_data.get("auto_approve", server_data.get("autoApprove", [])),
+        "is_enabled": not server_data.get("disabled", False),
+        "created_by_id": current_user.id
+    }
+    
+    if transport_type in ["sse", "http"]:
+        # SSE 서버 설정
+        url = server_data.get("url")
+        if not url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="URL is required for SSE servers"
+            )
+        
+        if not url.startswith(("http://", "https://")):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="URL must start with http:// or https://"
+            )
+        
+        server_config.update({
+            "url": url
+        })
+        
+        # SSE 서버는 command가 필요없음
+        server_config["command"] = None
+        
+    else:
+        # stdio 서버 설정
+        command = server_data.get("command")
+        if not command:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Command is required for stdio servers"
+            )
+        
+        server_config.update({
+            "command": command,
+            "args": server_data.get("args", []),
+            "env": server_data.get("env", {}),
+            "cwd": server_data.get("cwd")
+        })
+    
     # 서버 생성
-    server = McpServer(
-        project_id=project_id,
-        name=server_data.get("name"),
-        command=server_data.get("command"),
-        args=server_data.get("args", []),
-        env=server_data.get("env", {}),
-        is_enabled=not server_data.get("disabled", False),
-        description=server_data.get("description"),
-        cwd=server_data.get("cwd")
-    )
+    server = McpServer(**server_config)
+    
+    # SSE 서버인 경우 헤더 설정
+    if transport_type in ["sse", "http"] and "headers" in server_data:
+        server.headers = server_data["headers"]
     
     db.add(server)
     db.commit()
     db.refresh(server)
     
-    return {
+    # 응답 데이터 구성 (전송 타입별)
+    response_data = {
         "id": str(server.id),
         "name": server.name,
-        "command": server.command,
-        "args": server.args,
-        "env": server.env,
-        "disabled": server.disabled,
+        "transport_type": server.transport_type,
+        "timeout": server.timeout,
+        "auto_approve": server.auto_approve,
+        "disabled": not server.is_enabled,
         "status": server.status.value if server.status else "unknown",
         "created_at": server.created_at.isoformat() if server.created_at else None,
         "updated_at": server.updated_at.isoformat() if server.updated_at else None
     }
+    
+    if server.is_sse_server():
+        response_data.update({
+            "url": server.url,
+            "headers_count": len(server.headers)
+        })
+    else:
+        response_data.update({
+            "command": server.command,
+            "args": server.args,
+            "env_count": len(server.env)
+        })
+    
+    return response_data
 
 
 @router.put("/projects/{project_id}/servers/{server_id}")
@@ -686,6 +767,35 @@ async def get_project_cline_config(
         
         mcp_servers[server_key] = server_config
         
+        # 개별 SSE 서버들도 통합 모드에 포함되지만 별도 엔드포인트로 접근 가능
+        sse_servers = [s for s in servers if s.is_sse_server()]
+        if sse_servers:
+            for server in sse_servers:
+                individual_key = f"mcp-orch-{project_id}-{server.name}"
+                individual_config = {
+                    "type": "sse",
+                    "url": f"{base_url}/projects/{project_id}/servers/{server.name}/sse",
+                    "timeout": server.timeout,
+                    "disabled": False
+                }
+                
+                # 서버별 JWT 인증 확인
+                if server.get_effective_jwt_auth_required():
+                    individual_config["headers"] = {
+                        "Authorization": f"Bearer ${{{api_key.key_prefix}...}}"
+                    }
+                
+                # 서버의 커스텀 헤더 추가
+                if server.headers:
+                    if "headers" not in individual_config:
+                        individual_config["headers"] = {}
+                    individual_config["headers"].update(server.headers)
+                
+                mcp_servers[f"{individual_key}-direct"] = individual_config
+        
+        sse_count = len([s for s in servers if s.is_sse_server()])
+        stdio_count = len([s for s in servers if s.is_stdio_server()])
+        
         instructions = [
             "🚀 UNIFIED MCP SERVER CONFIGURATION",
             "1. Save this configuration as 'mcp_settings.json' in your project root",
@@ -693,44 +803,72 @@ async def get_project_cline_config(
             "3. Replace placeholder API keys with your actual full API key where needed",
             "4. This unified endpoint provides access to ALL project servers through a single connection",
             f"5. Tools are namespaced with format: 'server_name.tool_name' (separator: '.')",
-            f"6. Access {len(servers)} servers through one SSE endpoint: /projects/{project_id}/unified/sse",
+            f"6. Access {len(servers)} servers ({stdio_count} stdio + {sse_count} SSE) through one endpoint",
             "7. Error isolation: individual server failures won't affect other servers",
-            "8. Health monitoring and recovery tools available through 'orchestrator.*' meta tools"
+            "8. Health monitoring and recovery tools available through 'orchestrator.*' meta tools",
+            "9. Individual SSE servers also available as direct endpoints if needed"
         ]
         
     else:
-        # 개별 서버 모드 (기존 방식)
+        # 개별 서버 모드 (기존 방식 + SSE 지원)
         for server in servers:
             server_key = f"project-{project_id}-{server.name}"
             
             # 서버별 JWT 인증 설정 확인
             jwt_auth_required = server.get_effective_jwt_auth_required()
             
-            # Single Resource Connection mode - stdio 방식 (단일 모드)
-            server_config = {
-                "type": "stdio",
-                "command": server.command,
-                "args": server.args if server.args else [],
-                "env": server.env if server.env else {},
-                "timeout": 60,
-                "disabled": False
-            }
-            
-            # JWT 인증이 필요한 경우만 환경변수에 API 키 설정 추가
-            if jwt_auth_required:
-                if not server_config["env"]:
-                    server_config["env"] = {}
-                server_config["env"]["MCP_API_KEY"] = f"${{{api_key.key_prefix}...}}"
+            if server.is_sse_server():
+                # SSE 서버 설정
+                server_config = {
+                    "type": "sse",
+                    "url": server.url,  # 데이터베이스에 저장된 직접 URL
+                    "timeout": server.timeout,
+                    "disabled": False
+                }
+                
+                # JWT 인증이 필요한 경우 헤더에 API 키 설정
+                if jwt_auth_required:
+                    server_config["headers"] = {
+                        "Authorization": f"Bearer ${{{api_key.key_prefix}...}}"
+                    }
+                
+                # 서버의 커스텀 헤더 추가
+                if server.headers:
+                    if "headers" not in server_config:
+                        server_config["headers"] = {}
+                    server_config["headers"].update(server.headers)
+                
+            else:
+                # stdio 서버 설정 (기존 방식)
+                server_config = {
+                    "type": "stdio",
+                    "command": server.command,
+                    "args": server.args if server.args else [],
+                    "env": server.env if server.env else {},
+                    "timeout": server.timeout,
+                    "disabled": False
+                }
+                
+                # JWT 인증이 필요한 경우만 환경변수에 API 키 설정 추가
+                if jwt_auth_required:
+                    if not server_config["env"]:
+                        server_config["env"] = {}
+                    server_config["env"]["MCP_API_KEY"] = f"${{{api_key.key_prefix}...}}"
             
             mcp_servers[server_key] = server_config
+        
+        sse_count = len([s for s in servers if s.is_sse_server()])
+        stdio_count = len([s for s in servers if s.is_stdio_server()])
         
         instructions = [
             "📋 INDIVIDUAL SERVERS CONFIGURATION",
             "1. Save this configuration as 'mcp_settings.json' in your project root",
             "2. Configure Claude Desktop, Cursor, or other MCP clients to use this settings file", 
             "3. Replace placeholder API keys with your actual full API key where needed",
-            "4. Servers without MCP_API_KEY do not require authentication (based on server settings)",
-            f"5. Each server runs as separate stdio connection"
+            "4. Servers without authentication headers/env vars do not require auth",
+            f"5. Mixed transport types: {stdio_count} stdio + {sse_count} SSE servers",
+            "6. stdio servers run as separate processes, SSE servers connect to remote URLs",
+            "7. SSE servers support custom HTTP headers for authentication and configuration"
         ]
     
     cline_config = {
@@ -743,7 +881,7 @@ async def get_project_cline_config(
         "config": cline_config,
         "servers_count": len(servers),
         "api_key_prefix": api_key.key_prefix,
-        "mode": "unified" if unified else "individual",
-        "unified_endpoint": f"{base_url}/projects/{project_id}/unified/sse" if unified else None,
+        "mode": "unified" if use_unified else "individual",
+        "unified_endpoint": f"{base_url}/projects/{project_id}/unified/sse" if use_unified else None,
         "instructions": instructions
     }

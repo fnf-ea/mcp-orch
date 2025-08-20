@@ -1,0 +1,116 @@
+{
+  "mcpServers": {
+    "_comment": "=== MCP-ORCH SSE 서버 지원 예제 설정 ===",
+    
+    "stdio-github": {
+      "_description": "기존 stdio 방식 GitHub MCP 서버",
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "ghp_your_github_personal_access_token"
+      },
+      "timeout": 60,
+      "autoApprove": ["list_issues", "get_file"],
+      "disabled": false
+    },
+
+    "sse-remote-analytics": {
+      "_description": "SSE 방식 원격 분석 서버",
+      "type": "sse",
+      "url": "http://10.150.0.36:8000/mcp",
+      "timeout": 30,
+      "headers": {
+        "Authorization": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+        "X-Client-ID": "mcp-orch",
+        "X-API-Version": "v1"
+      },
+      "autoApprove": ["get_metrics", "list_reports"],
+      "disabled": false
+    },
+
+    "sse-cloud-database": {
+      "_description": "클라우드 데이터베이스 MCP 서버",
+      "type": "sse", 
+      "url": "https://db-mcp.example.com/sse",
+      "timeout": 45,
+      "headers": {
+        "X-API-Key": "ak_live_abcdef123456789",
+        "X-Database": "production",
+        "Content-Type": "application/json"
+      },
+      "autoApprove": ["query_readonly"],
+      "disabled": false
+    },
+
+    "sse-external-api": {
+      "_description": "외부 API 통합 MCP 서버",
+      "type": "sse",
+      "url": "https://api-gateway.corp.com/mcp/sse",
+      "timeout": 60,
+      "headers": {
+        "Authorization": "Bearer corp_token_xyz789",
+        "X-Team-ID": "engineering",
+        "X-Environment": "prod"
+      },
+      "autoApprove": [],
+      "disabled": false
+    },
+
+    "stdio-local-tools": {
+      "_description": "로컬 도구 stdio 서버",
+      "type": "stdio",
+      "command": "python",
+      "args": ["/opt/mcp-servers/local-tools/server.py"],
+      "env": {
+        "CONFIG_PATH": "/etc/mcp/local-tools.conf",
+        "LOG_LEVEL": "INFO"
+      },
+      "timeout": 30,
+      "autoApprove": ["file_list", "system_info"],
+      "disabled": false
+    },
+
+    "sse-development": {
+      "_description": "개발 환경 SSE 서버 (비활성화됨)",
+      "type": "sse",
+      "url": "http://localhost:8001/mcp",
+      "timeout": 15,
+      "headers": {
+        "Authorization": "Bearer dev_token_123",
+        "X-Environment": "development"
+      },
+      "autoApprove": ["*"],
+      "disabled": true,
+      "_note": "개발 중인 서버 - 프로덕션에서 비활성화"
+    }
+  },
+
+  "_usage_instructions": [
+    "1. 이 파일을 mcp-config.json으로 복사하여 사용하세요",
+    "2. 실제 인증 토큰과 URL로 교체하세요",
+    "3. stdio 서버: command/args/env 필드 필요",
+    "4. SSE 서버: url/headers 필드 필요", 
+    "5. autoApprove에 자동 승인할 도구명 나열",
+    "6. disabled: true로 설정하면 서버 비활성화",
+    "7. timeout: 연결 타임아웃 (초 단위)"
+  ],
+
+  "_transport_types": {
+    "stdio": "로컬 프로세스 기반 MCP 서버",
+    "sse": "HTTP SSE 기반 원격 MCP 서버"
+  },
+
+  "_authentication": {
+    "stdio": "환경변수(env)를 통한 인증 정보 전달", 
+    "sse": "HTTP 헤더(headers)를 통한 인증 정보 전달"
+  },
+
+  "_security_notes": [
+    "⚠️ 이 파일에는 민감한 인증 정보가 포함됩니다",
+    "📁 파일 권한을 600 (소유자만 읽기/쓰기)으로 설정하세요",
+    "🔒 버전 관리 시스템에 커밋하지 마세요",
+    "🔄 정기적으로 토큰을 갱신하세요",
+    "💽 mcp-orch 데이터베이스에서는 헤더/env가 암호화 저장됩니다"
+  ]
+}

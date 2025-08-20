@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response as StarletteResponse
 from starlette.status import HTTP_204_NO_CONTENT
+from starlette.middleware.cors import CORSMiddleware
 
 from ..config import Settings
 
@@ -164,22 +165,126 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
         return response
 
 
-class SuppressNoResponseReturnedMiddleware(BaseHTTPMiddleware):
+class SuppressNoResponseReturnedMiddleware:
     """
     SSE 연결 해제 시 발생하는 오류 처리 미들웨어
     
     SSE 엔드포인트에서 클라이언트가 연결을 해제할 때 발생하는
     AssertionError와 RuntimeError를 처리합니다.
+    
+    BaseHTTPMiddleware 대신 직접 ASGI 미들웨어로 구현하여
+    SSE 스트리밍과의 충돌을 방지합니다.
     """
     
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        """요청 처리"""
-        try:
-            return await call_next(request)
-        except (RuntimeError, AssertionError) as exc:
-            # "No response returned" 오류 또는 BaseMiddleware assertion 오류 처리
-            if (str(exc) == 'No response returned.' or 
-                'http.response.body' in str(exc)) and await request.is_disconnected():
+    def __init__(self, app):
+        self.app = app
+    
+    async def __call__(self, scope, receive, send):
+        """ASGI 호출 처리"""
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        
+        # SSE 엔드포인트인지 확인
+        path = scope.get("path", "")
+        is_sse = "/sse" in path or path.endswith("/messages")
+        
+        if not is_sse:
+            # SSE가 아닌 경우 정상 처리
+            await self.app(scope, receive, send)
+            return
+        
+        # SSE 엔드포인트는 에러 처리 래핑
+        async def wrapped_send(message):
+            try:
+                await send(message)
+            except (RuntimeError, ConnectionError) as exc:
+                # 연결이 끊긴 경우 조용히 처리
                 logger.debug(f"Client disconnected during SSE stream: {exc}")
-                return StarletteResponse(status_code=HTTP_204_NO_CONTENT)
+                return
+        
+        try:
+            await self.app(scope, receive, wrapped_send)
+        except (RuntimeError, AssertionError, ConnectionError) as exc:
+            # 스트리밍 중 연결 끊김 처리
+            if 'http.response.body' in str(exc) or 'No response returned' in str(exc):
+                logger.debug(f"SSE stream interrupted: {exc}")
+                # 이미 응답이 시작된 경우 아무것도 하지 않음
+                return
             raise
+
+
+class SSECompatibleCORSMiddleware:
+    """
+    SSE 호환 CORS 미들웨어
+    
+    SSE 엔드포인트에 대해서는 간단한 CORS 헤더만 추가하고,
+    일반 엔드포인트에 대해서는 표준 CORS 미들웨어를 사용합니다.
+    """
+    
+    def __init__(self, app, **cors_options):
+        self.app = app
+        self.cors_options = cors_options
+        # 일반 엔드포인트용 CORS 미들웨어
+        self.cors_middleware = CORSMiddleware(app, **cors_options)
+    
+    async def __call__(self, scope, receive, send):
+        """ASGI 호출 처리"""
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        
+        # SSE 엔드포인트인지 확인
+        path = scope.get("path", "")
+        is_sse = "/sse" in path or "/bridge/sse" in path or "/standard/sse" in path
+        
+        if is_sse:
+            # SSE 엔드포인트는 직접 CORS 헤더 처리
+            origin = None
+            headers = dict(scope.get("headers", []))
+            origin_bytes = headers.get(b"origin")
+            if origin_bytes:
+                origin = origin_bytes.decode("utf-8")
+            
+            async def sse_send(message):
+                if message["type"] == "http.response.start":
+                    # CORS 헤더 추가
+                    headers = dict(message.get("headers", []))
+                    cors_headers = [
+                        (b"access-control-allow-origin", origin.encode() if origin else b"*"),
+                        (b"access-control-allow-credentials", b"true"),
+                        (b"access-control-allow-methods", b"GET, POST, OPTIONS"),
+                        (b"access-control-allow-headers", b"*"),
+                        (b"cache-control", b"no-cache"),
+                        (b"connection", b"keep-alive"),
+                    ]
+                    
+                    # 기존 헤더에 추가 (중복 방지)
+                    existing_headers = list(message.get("headers", []))
+                    cors_header_names = {h[0] for h in cors_headers}
+                    filtered_headers = [h for h in existing_headers if h[0] not in cors_header_names]
+                    
+                    message["headers"] = filtered_headers + cors_headers
+                
+                await send(message)
+            
+            # OPTIONS 요청 처리
+            if scope["method"] == "OPTIONS":
+                await send({
+                    "type": "http.response.start",
+                    "status": 204,
+                    "headers": [
+                        (b"access-control-allow-origin", origin.encode() if origin else b"*"),
+                        (b"access-control-allow-credentials", b"true"),
+                        (b"access-control-allow-methods", b"GET, POST, OPTIONS"),
+                        (b"access-control-allow-headers", b"*"),
+                    ]
+                })
+                await send({"type": "http.response.body", "body": b""})
+                return
+            
+            # SSE 엔드포인트 실행
+            await self.app(scope, receive, sse_send)
+        else:
+            # 일반 엔드포인트는 표준 CORS 미들웨어 사용
+            await self.cors_middleware(scope, receive, send)

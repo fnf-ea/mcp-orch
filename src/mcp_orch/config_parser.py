@@ -17,17 +17,23 @@ logger = logging.getLogger(__name__)
 class MCPServerConfig:
     """Configuration for a single MCP server."""
     name: str
-    command: str
+    command: str = ""  # stdio용, SSE는 필요없음
     args: List[str] = field(default_factory=list)
     env: Dict[str, str] = field(default_factory=dict)
     timeout: int = 60
     auto_approve: List[str] = field(default_factory=list)
-    transport_type: str = "stdio"
+    transport_type: str = "stdio"  # "stdio" 또는 "sse"
     disabled: bool = False
+    
+    # SSE 전용 필드
+    url: Optional[str] = None  # SSE 서버 URL
+    headers: Dict[str, str] = field(default_factory=dict)  # SSE 요청 헤더
     
     @classmethod
     def from_dict(cls, name: str, data: Dict[str, Any]) -> 'MCPServerConfig':
         """Create MCPServerConfig from dictionary."""
+        transport_type = data.get('type', data.get('transportType', 'stdio'))  # 'type' 필드도 지원
+        
         return cls(
             name=name,
             command=data.get('command', ''),
@@ -35,9 +41,39 @@ class MCPServerConfig:
             env=data.get('env', {}),
             timeout=data.get('timeout', 60),
             auto_approve=data.get('autoApprove', []),
-            transport_type=data.get('transportType', 'stdio'),
-            disabled=data.get('disabled', False)
+            transport_type=transport_type,
+            disabled=data.get('disabled', False),
+            # SSE 전용 필드
+            url=data.get('url'),
+            headers=data.get('headers', {})
         )
+    
+    def is_sse_server(self) -> bool:
+        """SSE 서버인지 확인"""
+        return self.transport_type == "sse" or self.transport_type == "http"  # http는 SSE의 별칭
+    
+    def is_stdio_server(self) -> bool:
+        """stdio 서버인지 확인"""
+        return self.transport_type == "stdio"
+    
+    def validate(self) -> bool:
+        """설정 유효성 검증"""
+        if self.is_sse_server():
+            if not self.url:
+                logger.error(f"SSE server '{self.name}' requires 'url' field")
+                return False
+            if not self.url.startswith(('http://', 'https://')):
+                logger.error(f"SSE server '{self.name}' URL must start with http:// or https://")
+                return False
+        elif self.is_stdio_server():
+            if not self.command:
+                logger.error(f"stdio server '{self.name}' requires 'command' field")
+                return False
+        else:
+            logger.error(f"Unknown transport type for server '{self.name}': {self.transport_type}")
+            return False
+        
+        return True
 
 
 @dataclass
@@ -176,6 +212,7 @@ class ConfigParser:
         
         example_config = {
             "mcpServers": {
+                # stdio 방식 서버 예시
                 "github-server": {
                     "command": "npx",
                     "args": ["-y", "@modelcontextprotocol/server-github"],
@@ -184,7 +221,19 @@ class ConfigParser:
                     },
                     "timeout": 60,
                     "autoApprove": ["list_issues", "create_issue"],
-                    "transportType": "stdio",
+                    "type": "stdio",  # "stdio" 또는 "sse"
+                    "disabled": False
+                },
+                # SSE 방식 서버 예시
+                "remote-sse-server": {
+                    "url": "http://10.150.0.36:8000/mcp",
+                    "type": "sse",
+                    "timeout": 30,
+                    "headers": {
+                        "Authorization": "Bearer your-api-token",
+                        "X-Custom-Header": "value"
+                    },
+                    "autoApprove": ["safe_tool1", "safe_tool2"],
                     "disabled": False
                 },
                 "notion-server": {
@@ -193,7 +242,7 @@ class ConfigParser:
                     "env": {
                         "NOTION_API_KEY": "your-notion-api-key"
                     },
-                    "transportType": "stdio",
+                    "type": "stdio",
                     "disabled": True
                 },
                 "local-server": {

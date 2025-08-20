@@ -44,17 +44,34 @@ class McpConfigManager(IMcpConfigManager):
             Dict: Complete server configuration
         """
         try:
+            # Get transport type (default to stdio for backward compatibility)
+            transport_type = getattr(db_server, 'transport_type', 'stdio')
+            if not transport_type:
+                transport_type = 'stdio'
+            
+            logger.debug(f"🔍 Building config for server {db_server.name}: transport_type={transport_type}, url={getattr(db_server, 'url', None)}, command={getattr(db_server, 'command', None)}")
+            
             # Extract basic configuration
             config = {
                 "id": str(db_server.id),
                 "name": db_server.name,
-                "command": db_server.command,
-                "args": db_server.args or [],
-                "env": db_server.env or {},
+                "transport_type": transport_type,
                 "timeout": db_server.timeout or self.default_timeout,
                 "is_enabled": db_server.is_enabled,
                 "project_id": str(db_server.project_id)
             }
+            
+            # Add transport-specific fields
+            if transport_type == 'sse':
+                # SSE 서버 설정
+                config["url"] = db_server.url
+                config["headers"] = db_server.headers or {}
+                # SSE는 command/args/env가 필요없음
+            else:
+                # stdio 서버 설정
+                config["command"] = db_server.command
+                config["args"] = db_server.args or []
+                config["env"] = db_server.env or {}
             
             # Add optional fields if present
             if hasattr(db_server, 'description') and db_server.description:
@@ -118,34 +135,56 @@ class McpConfigManager(IMcpConfigManager):
             # Create a copy to avoid modifying original
             validated_config = config.copy()
             
-            # Validate required fields
-            required_fields = ["command"]
-            for field in required_fields:
-                if not validated_config.get(field):
-                    raise ValueError(f"Missing required field: {field}")
+            # Get transport type
+            transport_type = validated_config.get('transport_type', 'stdio')
             
-            # Normalize command
-            command = validated_config["command"].strip()
-            if not command:
-                raise ValueError("Command cannot be empty")
-            validated_config["command"] = command
+            # Validate required fields based on transport type
+            if transport_type == 'sse':
+                # SSE 서버는 URL이 필수
+                if not validated_config.get('url'):
+                    raise ValueError("Missing required field: url (for SSE server)")
+            else:
+                # stdio 서버는 command가 필수
+                if not validated_config.get('command'):
+                    raise ValueError("Missing required field: command (for stdio server)")
             
-            # Normalize arguments
-            args = validated_config.get("args", [])
-            if not isinstance(args, list):
-                if isinstance(args, str):
-                    # Split string arguments
-                    args = args.split() if args.strip() else []
-                else:
-                    args = []
-            validated_config["args"] = args
-            
-            # Normalize environment
-            env = validated_config.get("env", {})
-            if not isinstance(env, dict):
-                logger.warning("Environment must be a dictionary, using default")
-                env = {}
-            validated_config["env"] = env
+            # Transport-specific normalization
+            if transport_type == 'sse':
+                # SSE 서버 - URL 정규화
+                url = validated_config.get("url", "").strip()
+                if not url:
+                    raise ValueError("URL cannot be empty for SSE server")
+                validated_config["url"] = url
+                
+                # Headers 정규화
+                headers = validated_config.get("headers", {})
+                if not isinstance(headers, dict):
+                    logger.warning("Headers must be a dictionary, using default")
+                    headers = {}
+                validated_config["headers"] = headers
+            else:
+                # stdio 서버 - command/args/env 정규화
+                command = validated_config["command"].strip()
+                if not command:
+                    raise ValueError("Command cannot be empty")
+                validated_config["command"] = command
+                
+                # Normalize arguments
+                args = validated_config.get("args", [])
+                if not isinstance(args, list):
+                    if isinstance(args, str):
+                        # Split string arguments
+                        args = args.split() if args.strip() else []
+                    else:
+                        args = []
+                validated_config["args"] = args
+                
+                # Normalize environment
+                env = validated_config.get("env", {})
+                if not isinstance(env, dict):
+                    logger.warning("Environment must be a dictionary, using default")
+                    env = {}
+                validated_config["env"] = env
             
             # Validate and normalize timeout
             timeout = validated_config.get("timeout", self.default_timeout)

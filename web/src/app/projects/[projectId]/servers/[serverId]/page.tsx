@@ -240,7 +240,9 @@ export default function ProjectServerDetailPage() {
             args: server.args || [],
             env: server.env || {},
             cwd: server.cwd || '',
-            jwt_auth_required: server.jwt_auth_required
+            jwt_auth_required: server.jwt_auth_required,
+            url: server.url || '',  // SSE 서버 URL 추가
+            headers: server.headers || {}  // SSE 서버 헤더 추가
           }}
         />
       )}

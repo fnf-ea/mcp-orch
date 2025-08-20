@@ -34,8 +34,8 @@ class McpServer(Base):
     display_name = Column(String(255), nullable=True)
     description = Column(String(1000), nullable=True)
     
-    # Server configuration
-    command = Column(String(500), nullable=False)
+    # Server configuration - stdio 방식용
+    command = Column(String(500), nullable=True)  # SSE 서버는 command가 불필요
     
     # Legacy plaintext fields (for migration compatibility)
     _args_legacy = Column("args", JSON, default=list, nullable=True)
@@ -50,8 +50,13 @@ class McpServer(Base):
     # Server settings
     timeout = Column(Integer, default=60, nullable=False)
     auto_approve = Column(JSON, default=list, nullable=False)  # Auto-approved tools
-    transport_type = Column(String(50), default="stdio", nullable=False)
+    transport_type = Column(String(50), default="stdio", nullable=False)  # "stdio" 또는 "sse"
     compatibility_mode = Column(String(50), default="resource_connection", nullable=False, comment="MCP compatibility mode: resource_connection (single mode)")
+    
+    # SSE 전용 필드들
+    url = Column(String(2000), nullable=True, comment="SSE server URL (required for SSE transport)")
+    _headers_encrypted = Column(Text, nullable=True, comment="Encrypted JSON of HTTP headers for SSE requests")
+    _headers_legacy = Column("headers", JSON, default=dict, nullable=True, comment="Legacy plaintext headers (deprecated)")
     
     # Status and control
     status = Column(SQLEnum(McpServerStatus), default=McpServerStatus.INACTIVE, nullable=False)
@@ -215,6 +220,30 @@ class McpServer(Base):
             # If encryption fails, store in legacy field as fallback
             self._env_legacy = value
     
+    @hybrid_property
+    def headers(self):
+        """Get HTTP headers for SSE requests (decrypted)."""
+        from ..security.manager import SecretManager
+        
+        if self._headers_encrypted:
+            manager = SecretManager()
+            return manager.decrypt_server_config(self._headers_encrypted, {}, is_json=True)
+        return self._headers_legacy or {}
+    
+    @headers.setter
+    def headers(self, value: Dict[str, str]):
+        """Set HTTP headers for SSE requests (encrypted)."""
+        from ..security.manager import SecretManager
+        
+        # Clear legacy field when using encrypted storage
+        self._headers_legacy = None
+        
+        if value:
+            manager = SecretManager()
+            self._headers_encrypted = manager.encrypt_server_config(value, is_json=True)
+        else:
+            self._headers_encrypted = None
+    
     @property
     def is_encrypted(self) -> bool:
         """Check if server data is encrypted."""
@@ -238,17 +267,55 @@ class McpServer(Base):
     
     @property
     def config_dict(self) -> dict:
-        """Get server configuration as dictionary for mcp-config.json."""
-        return {
-            "command": self.command,
-            "args": self.args,
-            "env": self.env,
+        """Get server configuration as dictionary for mcp-config.json (SSE 지원 포함)."""
+        base_config = {
             "timeout": self.timeout,
             "autoApprove": self.auto_approve,
-            "transportType": self.transport_type,
+            "type": self.transport_type,  # "stdio" 또는 "sse"
             "serverType": "resource_connection",
             "disabled": not self.is_enabled
         }
+        
+        if self.is_sse_server():
+            # SSE 서버 설정
+            base_config.update({
+                "url": self.url,
+                "headers": self.headers
+            })
+        else:
+            # stdio 서버 설정
+            base_config.update({
+                "command": self.command,
+                "args": self.args,
+                "env": self.env
+            })
+        
+        return base_config
+    
+    def is_sse_server(self) -> bool:
+        """Check if this server uses SSE transport."""
+        return self.transport_type in ["sse", "http"]
+    
+    def is_stdio_server(self) -> bool:
+        """Check if this server uses stdio transport."""
+        return self.transport_type == "stdio"
+    
+    def validate_config(self) -> Dict[str, str]:
+        """Validate server configuration and return errors if any."""
+        errors = {}
+        
+        if self.is_sse_server():
+            if not self.url:
+                errors["url"] = "URL is required for SSE servers"
+            elif not self.url.startswith(("http://", "https://")):
+                errors["url"] = "URL must start with http:// or https://"
+        elif self.is_stdio_server():
+            if not self.command:
+                errors["command"] = "Command is required for stdio servers"
+        else:
+            errors["transport_type"] = f"Invalid transport type: {self.transport_type}"
+        
+        return errors
 
 
 class McpTool(Base):

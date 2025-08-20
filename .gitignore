@@ -182,3 +182,6 @@ test_data/
 # Local configuration
 config.local.json
 config.local.yaml
+
+.reference/
+.claude/agents/

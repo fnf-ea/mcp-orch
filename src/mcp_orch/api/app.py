@@ -10,13 +10,12 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from ..config import Settings
 from ..core.controller import DualModeController
-from .jwt_auth import JWTAuthMiddleware
-from .middleware import SuppressNoResponseReturnedMiddleware
+from .jwt_auth_asgi import JWTAuthASGIMiddleware, RequestStateMiddleware
+from .middleware import SuppressNoResponseReturnedMiddleware, SSECompatibleCORSMiddleware
 from .users import router as users_router
 # 기존 모놀리식 teams 라우터 임시 비활성화
 # from .teams import router as teams_router
@@ -193,17 +192,20 @@ def create_app(settings: Settings = None) -> FastAPI:
     # SSE 연결 해제 오류 처리 미들웨어 (가장 첫 번째)
     app.add_middleware(SuppressNoResponseReturnedMiddleware)
     
-    # CORS 미들웨어
+    # SSE 호환 CORS 미들웨어
     app.add_middleware(
-        CORSMiddleware,
+        SSECompatibleCORSMiddleware,
         allow_origins=settings.security.cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
     
-    # 통합 인증 미들웨어 (JWT + API 키 지원)
-    app.add_middleware(JWTAuthMiddleware, settings=settings)
+    # Request state 매핑 미들웨어
+    app.add_middleware(RequestStateMiddleware)
+    
+    # 통합 인증 ASGI 미들웨어 (JWT + API 키 지원)
+    app.add_middleware(JWTAuthASGIMiddleware, settings=settings)
     
     # Health check endpoint (인증 불필요)
     @app.get("/health", tags=["System"])
@@ -884,3 +886,7 @@ async def send_response_to_sse_session(session_id: str, response_data: Dict[str,
             logger.warning(f"Failed to send response to SSE session {session_id}")
     except Exception as e:
         logger.error(f"Error sending response to SSE session {session_id}: {e}")
+
+
+# 앱 인스턴스 생성 (uvicorn을 위해)
+app = create_app()

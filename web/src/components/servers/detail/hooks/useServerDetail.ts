@@ -101,13 +101,47 @@ export function useServerDetail({ projectId, serverId }: UseServerDetailProps): 
       if (response.ok) {
         const data = await response.json();
         console.log('✅ 서버 상세 정보 로드 성공:', data);
+        console.log('=== Server Detail Data Structure ===');
+        console.log('Server ID:', data.id);
+        console.log('Server Name:', data.name);
+        console.log('Transport Type:', data.transport_type);
+        console.log('Command:', data.command);
+        console.log('Args:', data.args);
+        console.log('Environment Variables:', data.env);
+        console.log('CWD:', data.cwd);
+        console.log('JWT Auth Required:', data.jwt_auth_required);
+        console.log('Status:', data.status);
+        console.log('Tools Count:', data.tools_count);
+        console.log('Full Server Object:', JSON.stringify(data, null, 2));
+        
+        // API 응답 변환 (stdio와 SSE 호환성을 위해)
+        const transformedData = {
+          ...data,
+          // 도구 스키마 필드 통일: inputSchema -> schema
+          tools: data.tools?.map((tool: any) => {
+            console.log('🔧 Tool transformation:', {
+              name: tool.name,
+              hasInputSchema: !!tool.inputSchema,
+              hasSchema: !!tool.schema,
+              inputSchema: tool.inputSchema,
+              originalTool: tool
+            });
+            
+            return {
+              ...tool,
+              schema: tool.inputSchema || tool.schema // inputSchema를 schema로 매핑
+            };
+          }) || []
+        };
+        
+        console.log('🔧 Transformed tools:', transformedData.tools);
         
         // 상세 정보로 업데이트
         setServer(prevServer => ({
-          ...data,
+          ...transformedData,
           // 기본 정보에서 이미 로드된 필드 유지 (깜빡임 방지)
-          name: prevServer?.name || data.name,
-          description: prevServer?.description || data.description
+          name: prevServer?.name || transformedData.name,
+          description: prevServer?.description || transformedData.description
         }));
         
         // 타임아웃 상태인 경우 사용자에게 알림
@@ -124,9 +158,18 @@ export function useServerDetail({ projectId, serverId }: UseServerDetailProps): 
           
           // 에러 응답에 서버 정보가 포함되어 있는지 확인
           if (errorData.server) {
+            // 에러 응답의 서버 정보도 변환
+            const transformedErrorServer = {
+              ...errorData.server,
+              tools: errorData.server.tools?.map((tool: any) => ({
+                ...tool,
+                schema: tool.inputSchema || tool.schema
+              })) || []
+            };
+            
             setServer(prevServer => ({
               ...prevServer,
-              ...errorData.server,
+              ...transformedErrorServer,
               status: 'timeout'
             }));
           } else {

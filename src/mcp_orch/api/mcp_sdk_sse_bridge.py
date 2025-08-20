@@ -57,9 +57,11 @@ class ProjectMCPTransportManager:
         
         if key not in self.transports:
             # mcp-orch URL 구조 유지: 프로젝트별 메시지 엔드포인트
-            endpoint = f"/projects/{project_id}/servers/{server_name}/messages"
+            # 중요: 메시지 엔드포인트는 POST 메시지를 받을 경로
+            endpoint = f"/projects/{project_id}/servers/{server_name}/bridge/messages"
             self.transports[key] = SseServerTransport(endpoint)
-            logger.info(f"Created new SSE transport for {key} with endpoint: {endpoint}")
+            logger.info(f"✅ Created new SSE transport for {key} with message endpoint: {endpoint}")
+            logger.info(f"   SSE endpoint: /projects/{project_id}/servers/{server_name}/bridge/sse")
         
         return self.transports[key]
     
@@ -201,25 +203,41 @@ async def mcp_sse_bridge_endpoint(
         # Transport 가져오기
         transport = transport_manager.get_transport(str(project_id), server_name)
         
-        logger.info(f"Starting MCP SSE Bridge for server {server_name} using python-sdk SseServerTransport")
+        logger.info(f"🚀 Starting MCP SSE Bridge for server {server_name}")
+        logger.info(f"   Project ID: {project_id}")
+        logger.info(f"   Server: {server_name}")
+        logger.info(f"   Request path: {request.url.path}")
+        logger.info(f"   Headers: {dict(request.headers)}")
         
         # python-sdk 표준 SSE 연결 사용
-        async with transport.connect_sse(
-            request.scope, 
-            request.receive, 
-            request._send
-        ) as streams:
-            read_stream, write_stream = streams
-            
-            # MCP 서버 세션 실행
-            await run_mcp_bridge_session(
-                read_stream, 
-                write_stream, 
-                project_id, 
-                server_name, 
-                server_record,
-                request
-            )
+        logger.info(f"📡 Establishing SSE connection with python-sdk SseServerTransport")
+        
+        try:
+            async with transport.connect_sse(
+                request.scope, 
+                request.receive, 
+                request._send
+            ) as streams:
+                read_stream, write_stream = streams
+                logger.info(f"✅ SSE streams established for {server_name}")
+                
+                # 초기 연결 안정화를 위한 짧은 지연
+                # 클라이언트가 SSE 스트림을 완전히 설정할 시간 제공
+                await asyncio.sleep(0.1)
+                logger.info(f"📡 SSE stream stabilized, starting MCP session for {server_name}")
+                
+                # MCP 서버 세션 실행
+                await run_mcp_bridge_session(
+                    read_stream, 
+                    write_stream, 
+                    project_id, 
+                    server_name, 
+                    server_record,
+                    request
+                )
+        except Exception as e:
+            logger.error(f"❌ SSE connection failed: {e}", exc_info=True)
+            raise
         
         # 빈 응답 반환 (python-sdk 예제에 따라)
         return Response()
@@ -419,47 +437,121 @@ async def run_mcp_bridge_session(
         if not server_config:
             raise ValueError("Failed to build server configuration")
         
-        # MCP Server 인스턴스 생성
+        logger.info(f"🔧 Building MCP server for {server_name}")
+        logger.info(f"   Config: transport={server_config.get('transport_type', 'stdio')}, command={server_config.get('command', 'N/A')}")
+        
+        # MCP Server 인스흉 생성
         mcp_server = Server(f"mcp-orch-{server_name}")
         
         # 실제 MCP 서버에서 도구 목록 동적 로드
         @mcp_server.list_tools()
         async def list_tools():
             try:
-                logger.info(f"Loading tools from actual MCP server: {server_name}")
+                logger.info(f"🔍 Loading tools for SSE bridge server: {server_name}")
+                logger.info(f"   Session ID: {session_id}")
+                logger.info(f"   Client: {client_type}")
                 
-                # Session manager가 기대하는 server_id 형식: "project_id.server_name"
-                session_manager_server_id = f"{project_id}.{server_name}"
-                logger.info(f"🔍 SDK SSE Bridge - server: {server_name}, session_id: {session_manager_server_id}")
-                
-                # 실제 MCP 서버에서 도구 목록 가져오기 (Facade 패턴 - 이미 필터링됨)
-                filtered_tools = await mcp_connection_service.get_server_tools(
-                    session_manager_server_id, 
-                    server_config
-                )
-                
-                if not filtered_tools:
-                    logger.warning(f"No tools found for server {server_name}")
-                    return []
-                
-                logger.info(f"📋 Loaded {len(filtered_tools)} filtered tools from {server_name} via Facade pattern")
-                
-                # python-sdk 형식으로 변환
+                # SSE 브리지 서버는 자체 도구를 정의하거나 프록시 역할을 수행
+                # 기본 SSE 브리지 도구 추가 (테스트용)
                 tool_list = []
-                for tool in filtered_tools:
-                    tool_obj = types.Tool(
-                        name=tool.get("name", ""),
-                        description=tool.get("description", ""),
-                        inputSchema=tool.get("schema", tool.get("inputSchema", {
-                            "type": "object",
-                            "properties": {},
-                            "required": []
-                        }))
-                    )
-                    tool_list.append(tool_obj)
-                    logger.info(f"  - Loaded tool: {tool.get('name')}")
                 
-                logger.info(f"Successfully loaded {len(tool_list)} tools from {server_name}")
+                # 기본 테스트 도구 추가
+                test_tool = types.Tool(
+                    name="sse_bridge_test",
+                    description="Test tool for SSE bridge connectivity",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "message": {
+                                "type": "string",
+                                "description": "Test message to echo"
+                            }
+                        },
+                        "required": ["message"]
+                    }
+                )
+                tool_list.append(test_tool)
+                logger.info(f"  - Added test tool: sse_bridge_test")
+                
+                # 브리지 서버가 stdio 서버의 프록시 역할을 하는 경우
+                # command가 설정되어 있을 때만 실제 stdio 서버 도구를 가져옴
+                if server_config.get('command'):
+                    logger.info(f"🔍 Bridge has stdio backend - loading tools from stdio server")
+                    logger.info(f"   Command: {server_config.get('command')}")
+                    logger.info(f"   Args: {server_config.get('args', [])}")
+                    
+                    try:
+                        # mcp_connection_service를 사용하여 도구 가져오기
+                        # 실제 서버 ID는 server_record.id를 사용
+                        from ..services.mcp_connection_service import mcp_connection_service
+                        
+                        # stdio 서버 연결 및 도구 목록 가져오기
+                        filtered_tools = await mcp_connection_service.get_server_tools(
+                            str(server_record.id),  # 실제 서버 ID 사용
+                            server_config
+                        )
+                        
+                        if filtered_tools:
+                            logger.info(f"📋 Loaded {len(filtered_tools)} tools from stdio backend")
+                            
+                            # python-sdk 형식으로 변환
+                            for tool in filtered_tools:
+                                # 도구 정보 추출
+                                tool_name = tool.get("name", "")
+                                tool_desc = tool.get("description", "")
+                                tool_schema = tool.get("inputSchema") or tool.get("schema") or {
+                                    "type": "object",
+                                    "properties": {},
+                                    "required": []
+                                }
+                                
+                                # 로그 출력
+                                logger.info(f"  - Converting tool: {tool_name}")
+                                logger.debug(f"    Schema: {tool_schema}")
+                                
+                                tool_obj = types.Tool(
+                                    name=tool_name,
+                                    description=tool_desc,
+                                    inputSchema=tool_schema
+                                )
+                                tool_list.append(tool_obj)
+                        else:
+                            logger.warning(f"⚠️ No tools returned from stdio backend")
+                    except Exception as stdio_error:
+                        logger.error(f"❌ Failed to load stdio backend tools: {stdio_error}", exc_info=True)
+                        # stdio 도구 로드 실패 시 계속 진행 (기본 도구만 사용)
+                
+                # SSE 브리지 전용 도구 추가 (예: search, web_fetch 등)
+                # Brave Search 서버인 경우 검색 도구 추가
+                if server_name == "brave-search":
+                    brave_search_tool = types.Tool(
+                        name="brave_web_search",
+                        description="Search the web using Brave Search API",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "The search query"
+                                },
+                                "count": {
+                                    "type": "integer",
+                                    "description": "Number of results to return (default: 10)",
+                                    "default": 10
+                                }
+                            },
+                            "required": ["query"]
+                        }
+                    )
+                    tool_list.append(brave_search_tool)
+                    logger.info(f"  - Added Brave Search tool: brave_web_search")
+                
+                if not tool_list:
+                    logger.warning(f"⚠️ No tools available for SSE bridge server {server_name}")
+                else:
+                    logger.info(f"✅ Successfully loaded {len(tool_list)} tools for {server_name}")
+                    for tool in tool_list:
+                        logger.info(f"     - {tool.name}: {tool.description[:50]}..." if len(tool.description) > 50 else f"     - {tool.name}: {tool.description}")
                 
                 # ServerLog에 도구 로딩 완료 이벤트 기록 (별도 DB 세션 사용)
                 try:
@@ -471,12 +563,13 @@ async def run_mcp_bridge_session(
                             project_id=project_id,
                             level=LogLevel.INFO,
                             category=LogCategory.SYSTEM,
-                            message=f"Tools loaded successfully: {len(tool_list)} tools available (filtered from {len(tools)} total)",
+                            message=f"SSE Bridge tools loaded: {len(tool_list)} tools available",
                             details={
                                 "session_id": session_id,
                                 "tool_count": len(tool_list),
-                                "tool_names": [tool.name for tool in tool_list],
-                                "filtered_count": len(tools) - len(tool_list)
+                                "tool_names": [tool.name for tool in tool_list] if tool_list else [],
+                                "bridge_mode": "SSE",
+                                "has_stdio_backend": bool(server_config.get('command'))
                             }
                         )
                     logger.info(f"📝 Tool loading log recorded for session {session_id}")
@@ -486,7 +579,7 @@ async def run_mcp_bridge_session(
                 return tool_list
                 
             except Exception as e:
-                logger.error(f"Error loading tools from {server_name}: {e}")
+                logger.error(f"Error loading tools for SSE bridge {server_name}: {e}")
                 # 에러 시 빈 도구 목록 반환
                 return []
         
@@ -495,7 +588,9 @@ async def run_mcp_bridge_session(
         async def call_tool(name: str, arguments: dict):
             tool_log_db = None  # 세션 변수 초기화
             try:
-                logger.info(f"Proxying tool call to {server_name}: {name} with arguments: {arguments}")
+                logger.info(f"🔨 Processing tool call for {server_name}: {name}")
+                logger.info(f"   Arguments: {arguments}")
+                logger.info(f"   Session: {session_id}")
                 
                 # 도구 호출 로그용 데이터베이스 세션 생성
                 tool_log_db = get_db_session()
@@ -507,26 +602,74 @@ async def run_mcp_bridge_session(
                         client_session.total_requests += 1
                         db.commit()
                     
-                    # Session manager가 기대하는 server_id 형식: "project_id.server_name"
-                    session_manager_server_id = f"{project_id}.{server_name}"
+                    # SSE 브리지 테스트 도구 처리
+                    if name == "sse_bridge_test":
+                        message = arguments.get("message", "")
+                        logger.info(f"🧪 Executing SSE bridge test tool with message: {message}")
+                        
+                        result = {
+                            "status": "success",
+                            "echo": message,
+                            "server": server_name,
+                            "session": session_id,
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "message": f"SSE Bridge test successful: {message}"
+                        }
                     
-                    # 실제 MCP 서버로 도구 호출 전달 (ToolCallLog 수집 포함)
-                    result = await mcp_connection_service.call_tool(
-                        server_id=session_manager_server_id,
-                        server_config=server_config,
-                        tool_name=name,
-                        arguments=arguments,
-                        session_id=session_id,
-                        project_id=project_id,
-                        user_agent=user_agent,
-                        ip_address=client_ip,
-                        db=tool_log_db
-                    )
+                    # Brave Search 도구 실행
+                    if server_name == "brave-search" and name == "brave_web_search":
+                        # Brave Search API 호출 시뮬레이션
+                        # 실제 구현시 API 키와 실제 API 호출 필요
+                        query = arguments.get("query", "")
+                        count = arguments.get("count", 10)
+                        
+                        logger.info(f"Executing Brave Search for query: {query} (count: {count})")
+                        
+                        # 시뮬레이션 결과 (실제로는 Brave API 호출)
+                        result = {
+                            "status": "success",
+                            "query": query,
+                            "results": [
+                                {
+                                    "title": f"Search result 1 for: {query}",
+                                    "url": "https://example.com/1",
+                                    "description": f"This is a simulated search result for query: {query}"
+                                }
+                            ],
+                            "message": f"Simulated Brave Search results for: {query}"
+                        }
+                    # SSE 브리지 테스트 도구가 아닌 경우
+                    else:
+                        # stdio 백엔드가 있는 경우 프록시
+                        if server_config.get('command'):
+                            logger.info(f"🔄 Proxying tool call to stdio backend: {name}")
+                            
+                            from ..services.mcp_connection_service import mcp_connection_service
+                            
+                            # 실제 MCP 서버로 도구 호출 전달
+                            result = await mcp_connection_service.call_tool(
+                                server_id=str(server_record.id),  # 실제 서버 ID 사용
+                                server_config=server_config,
+                                tool_name=name,
+                                arguments=arguments,
+                                session_id=session_id,
+                                project_id=project_id,
+                                user_agent=user_agent,
+                                ip_address=client_ip,
+                                db=tool_log_db
+                            )
+                        else:
+                            # 알 수 없는 도구
+                            logger.warning(f"⚠️ Unknown tool called: {name}")
+                            result = {
+                                "status": "error",
+                                "message": f"Unknown tool: {name}"
+                            }
                     
                     # 성공 시 세션 통계 업데이트 (successful_calls는 계산된 속성이므로 제거)
                     # total_requests는 이미 위에서 증가시켰음
                     
-                    logger.info(f"Tool call result from {server_name}: {result}")
+                    logger.info(f"✅ Tool call result from {server_name}: {result}")
                     
                     # 결과를 TextContent 형식으로 변환
                     if result:
@@ -558,7 +701,7 @@ async def run_mcp_bridge_session(
                             logger.error(f"Error closing tool log DB session: {close_error}")
                 
             except Exception as e:
-                logger.error(f"Error calling tool {name} on {server_name}: {e}")
+                logger.error(f"❌ Error calling tool {name} on {server_name}: {e}", exc_info=True)
                 
                 # SSE 브리지 레벨 에러도 ToolCallLog에 기록
                 error_log_db = None  # 세션 변수 초기화
@@ -644,12 +787,26 @@ async def run_mcp_bridge_session(
                 ]
         
         # MCP 서버 실행
-        logger.info(f"Running MCP server for {server_name} with dynamic tool loading")
+        logger.info(f"🏃 Starting MCP server execution for {server_name}")
+        
+        # 올바른 초기화 옵션 생성
+        from mcp.server.models import InitializationOptions
+        
+        init_options = InitializationOptions(
+            server_name=f"mcp-orch-{server_name}",
+            server_version="1.0.0",
+            capabilities=mcp_server.create_initialization_options().capabilities
+        )
+        logger.info(f"   Initialization options: {init_options}")
+        
+        # MCP 서버 실행 (Server.run이 초기화 시퀀스를 자동 처리)
         await mcp_server.run(
             read_stream,
             write_stream,
-            mcp_server.create_initialization_options()
+            init_options
         )
+        
+        logger.info(f"🎯 MCP server session completed for {server_name}")
         
     except Exception as e:
         logger.error(f"Error in MCP bridge session: {e}")

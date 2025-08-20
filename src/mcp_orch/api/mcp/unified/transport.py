@@ -427,3 +427,56 @@ class UnifiedMCPTransport(MCPSSETransport):
             )
             
             logger.info(f"🏁 Unified MCP session ended: session={self.session_id}, transport={self.transport_type}")
+    
+    async def cleanup(self):
+        """
+        Clean up resources and connections
+        
+        Performs graceful cleanup of:
+        - Message queue
+        - Server connections
+        - Health monitoring
+        - Session data
+        """
+        try:
+            logger.info(f"🧹 Starting cleanup for unified session {self.session_id}")
+            
+            # 1. Stop message processing
+            self.is_connected = False
+            
+            # 2. Clear message queue
+            if hasattr(self, 'message_queue'):
+                # Signal termination to any waiting consumers
+                await self.message_queue.put(None)
+                # Clear remaining messages
+                while not self.message_queue.empty():
+                    try:
+                        self.message_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+            
+            # 3. Close server connections
+            for server_name, connection in self.server_connections.items():
+                try:
+                    if connection and hasattr(connection, 'close'):
+                        await connection.close()
+                        logger.debug(f"✅ Closed connection for server {server_name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Error closing connection for server {server_name}: {e}")
+            
+            # 4. Clear server registries
+            self.server_connections.clear()
+            self.server_health.clear()
+            
+            # 5. Log cleanup completion
+            self.structured_logger.session_event(
+                "session_cleanup",
+                cleanup_status="completed"
+            )
+            
+            logger.info(f"✅ Cleanup completed for unified session {self.session_id}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error during cleanup for session {self.session_id}: {e}")
+            # Still try to mark as disconnected
+            self.is_connected = False

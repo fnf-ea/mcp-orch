@@ -41,6 +41,12 @@ class McpConnection:
     
     async def is_alive(self) -> bool:
         """Check if the underlying process is still alive"""
+        # SSE 서버는 process가 없으므로 server_config로 판단
+        if self.server_config.get('transport_type') == 'sse':
+            # SSE 연결은 항상 "alive"로 간주 (실제 테스트는 요청 시점에)
+            return True
+        
+        # stdio 서버는 process 상태 확인
         if self.process is None:
             return False
         return self.process.returncode is None
@@ -140,6 +146,13 @@ class McpConnectionManager(IMcpConnectionManager):
             bool: True if connection test succeeds
         """
         try:
+            transport_type = server_config.get('transport_type', 'stdio')
+            
+            # SSE 서버 연결 테스트
+            if transport_type == 'sse':
+                return await self._test_sse_connection(server_config)
+            
+            # stdio 서버 연결 테스트 (기존 로직)
             command = server_config.get('command', '')
             args = server_config.get('args', [])
             env = server_config.get('env', {})
@@ -225,6 +238,126 @@ class McpConnectionManager(IMcpConnectionManager):
             logger.error(f"MCP connection test failed: {e}")
             return False
     
+    async def _test_sse_connection(self, server_config: Dict) -> bool:
+        """
+        Test SSE server connection
+        
+        Args:
+            server_config: SSE server configuration with url and headers
+            
+        Returns:
+            bool: True if SSE server is reachable
+        """
+        try:
+            import aiohttp
+            
+            url = server_config.get('url', '')
+            headers = server_config.get('headers', {})
+            timeout = server_config.get('timeout', 10)
+            
+            if not url:
+                logger.warning("❌ No URL specified for SSE server")
+                return False
+            
+            logger.info(f"🔍 Testing SSE connection to: {url}")
+            
+            # SSE 서버는 Server-Sent Events를 사용하므로 
+            # 먼저 간단한 GET 요청으로 서버가 응답하는지 확인
+            async with aiohttp.ClientSession() as session:
+                try:
+                    # SSE endpoint는 보통 GET으로 스트림을 열기 때문에 GET 요청 시도
+                    async with session.get(
+                        url,
+                        headers={**headers, 'Accept': 'text/event-stream'},
+                        timeout=aiohttp.ClientTimeout(total=timeout)
+                    ) as response:
+                        # SSE 서버는 보통 200 OK로 응답하고 스트림을 열어둠
+                        if response.status in [200, 204]:
+                            logger.info(f"✅ SSE connection test successful: {url} (HTTP {response.status})")
+                            return True
+                        # 405 Method Not Allowed는 서버가 존재하지만 GET을 지원하지 않는 경우
+                        elif response.status == 405:
+                            logger.info(f"⚠️ SSE server exists but doesn't support GET: {url}")
+                            # POST로 재시도
+                            return await self._test_sse_connection_with_post(server_config)
+                        else:
+                            logger.warning(f"❌ SSE connection test failed: HTTP {response.status}")
+                            return False
+                            
+                except asyncio.TimeoutError:
+                    logger.warning(f"⏰ SSE connection test timed out: {url}")
+                    return False
+                except aiohttp.ClientError as e:
+                    logger.warning(f"❌ SSE connection test failed: {e}")
+                    return False
+                    
+        except ImportError:
+            logger.error("aiohttp is required for SSE connections. Install with: pip install aiohttp")
+            return False
+        except Exception as e:
+            logger.error(f"SSE connection test failed: {e}")
+            return False
+    
+    async def _test_sse_connection_with_post(self, server_config: Dict) -> bool:
+        """
+        Test SSE server connection with POST (for servers that don't support GET)
+        """
+        try:
+            import aiohttp
+            
+            url = server_config.get('url', '')
+            headers = server_config.get('headers', {})
+            timeout = server_config.get('timeout', 10)
+            
+            logger.info(f"🔍 Testing SSE connection with POST to: {url}")
+            
+            # MCP 초기화 메시지
+            init_message = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "roots": {"listChanged": True},
+                        "sampling": {}
+                    },
+                    "clientInfo": {
+                        "name": "mcp-orch",
+                        "version": "1.0.0"
+                    }
+                }
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.post(
+                        url, 
+                        json=init_message,
+                        headers={**headers, 'Content-Type': 'application/json'},
+                        timeout=aiohttp.ClientTimeout(total=timeout)
+                    ) as response:
+                        if response.status in [200, 202, 204]:
+                            logger.info(f"✅ SSE POST connection test successful: {url}")
+                            return True
+                        else:
+                            logger.warning(f"❌ SSE POST connection test failed: HTTP {response.status}")
+                            return False
+                            
+                except asyncio.TimeoutError:
+                    logger.warning(f"⏰ SSE POST connection test timed out: {url}")
+                    return False
+                except aiohttp.ClientError as e:
+                    logger.warning(f"❌ SSE POST connection test failed: {e}")
+                    return False
+                    
+        except ImportError:
+            logger.error("aiohttp is required for SSE connections. Install with: pip install aiohttp")
+            return False
+        except Exception as e:
+            logger.error(f"SSE connection test failed: {e}")
+            return False
+    
     async def is_connection_alive(self, connection: McpConnection) -> bool:
         """
         Check if existing connection is still alive
@@ -255,13 +388,28 @@ class McpConnectionManager(IMcpConnectionManager):
     
     async def _create_new_connection(self, server_config: Dict) -> McpConnection:
         """Create a new MCP server connection"""
+        transport_type = server_config.get('transport_type', 'stdio')
+        server_id = server_config.get('id', 'unknown')
+        
+        # SSE 서버 연결
+        if transport_type == 'sse':
+            url = server_config.get('url', '')
+            if not url:
+                raise ValueError("No URL specified for SSE server")
+            
+            # SSE 연결은 process가 없으므로 None으로 설정
+            # 실제 SSE 연결은 요청 시점에 생성됨
+            connection = McpConnection(server_id, server_config, None)
+            logger.info(f"✅ Created SSE connection configuration for server {server_id}")
+            return connection
+        
+        # stdio 서버 연결 (기존 로직)
         command = server_config.get('command', '')
         args = server_config.get('args', [])
         env = server_config.get('env', {})
-        server_id = server_config.get('id', 'unknown')
         
         if not command:
-            raise ValueError("No command specified for MCP server")
+            raise ValueError("No command specified for stdio server")
         
         # Prepare environment
         full_env = os.environ.copy()

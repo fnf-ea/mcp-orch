@@ -92,26 +92,32 @@ export default function ProjectServersPage() {
   // Start server editing
   const handleEditServer = (server: any) => {
     console.log('🔍 handleEditServer received server:', server);
-    console.log('🔍 server.compatibility_mode:', server.compatibility_mode);
+    console.log('🔍 server.transport:', server.transport);
     console.log('🔍 server.transport_type:', server.transport_type);
+    console.log('🔍 server.url:', server.url);
+    console.log('🔍 server.headers:', server.headers);
+    console.log('🔍 server.command:', server.command);
     
     const editingServerData = {
       id: server.id,
       name: server.name,
       description: server.description,
-      transport: server.transportType || server.transport_type || 'stdio',
+      transport: server.transport || server.transport_type || 'stdio',  // transport 필드를 먼저 확인
       compatibility_mode: server.compatibility_mode || 'api_wrapper',
       serverType: server.compatibility_mode || 'api_wrapper',  // 프론트엔드 필드도 추가
       command: server.command || '',
       args: server.args || [],
       jwt_auth_required: server.jwt_auth_required ?? null,
       env: server.env || {},
-      cwd: server.cwd || ''
+      cwd: server.cwd || '',
+      // SSE 서버 필드 추가
+      url: server.url || '',
+      headers: server.headers || {}
     };
     
     console.log('🔍 Setting editingServer to:', editingServerData);
-    console.log('🔍 editingServerData.compatibility_mode:', editingServerData.compatibility_mode);
-    console.log('🔍 editingServerData.serverType:', editingServerData.serverType);
+    console.log('🔍 editingServerData.transport:', editingServerData.transport);
+    console.log('🔍 Is SSE?:', editingServerData.transport === 'sse');
     setEditingServer(editingServerData);
   };
 
@@ -438,7 +444,7 @@ export default function ProjectServersPage() {
               <CardContent>
                 <div className="space-y-3">
                   <div className="flex items-center gap-4 text-sm text-muted-foreground">
-                    <div>Type: {(server as any).transport_type || 'stdio'}</div>
+                    <div>Type: {(server as any).transport || (server as any).transport_type || 'stdio'}</div>
                     <div>Tools: {server.tools_count || (server as any).availableTools || 0}</div>
                     <div className="flex items-center gap-1">
                       {(server as any).jwt_auth_required === null ? (

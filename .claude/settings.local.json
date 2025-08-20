@@ -23,12 +23,14 @@
       "Bash(uv run:*)",
       "Bash(uv pip:*)",
       "WebFetch(domain:github.com)",
-      "mcp__serena__think_about_collected_information"
+      "mcp__serena__think_about_collected_information",
+      "Bash(grep:*)"
     ],
     "deny": []
   },
   "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "serena"
-  ]
+  ],
+  "outputStyle": "Explanatory"
 }

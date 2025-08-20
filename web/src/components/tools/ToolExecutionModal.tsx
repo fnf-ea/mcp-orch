@@ -38,6 +38,16 @@ export function ToolExecutionModal({ tool, isOpen, onClose }: ToolExecutionModal
 
   if (!tool) return null
 
+  // 도구 객체 디버그 로그
+  console.log('🛠️ ToolExecutionModal received tool:', {
+    name: tool.name,
+    hasInputSchema: !!tool.inputSchema,
+    hasSchema: !!tool.schema,
+    inputSchema: tool.inputSchema,
+    schema: tool.schema,
+    fullTool: tool
+  })
+
   const handleParameterChange = (paramName: string, value: any) => {
     setParameters(prev => ({
       ...prev,
