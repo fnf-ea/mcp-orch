@@ -28,11 +28,17 @@ logger = logging.getLogger(__name__)
 # Pydantic Models
 class McpServerCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255, description="서버 이름")
-    command: str = Field(..., min_length=1, description="실행 명령어")
+    # SSE 서버는 command가 필요없음
+    command: Optional[str] = Field(None, min_length=1, description="실행 명령어 (stdio 방식)")
     args: Optional[List[str]] = Field(default_factory=list, description="명령어 인수")
     env: Optional[Dict[str, str]] = Field(default_factory=dict, description="환경변수")
     timeout: Optional[int] = Field(30, gt=0, le=300, description="연결 타임아웃 (초)")
     is_enabled: bool = Field(True, description="서버 활성화 상태")
+    # SSE 서버 전용 필드
+    transport_type: Optional[str] = Field("stdio", description="전송 방식: stdio 또는 sse")
+    url: Optional[str] = Field(None, description="SSE 서버 URL (sse 방식)") 
+    headers: Optional[Dict[str, str]] = Field(default_factory=dict, description="HTTP 헤더 (sse 방식)")
+    description: Optional[str] = Field(None, description="서버 설명")
 
 
 class McpServerUpdate(BaseModel):
@@ -43,12 +49,17 @@ class McpServerUpdate(BaseModel):
     timeout: Optional[int] = Field(None, gt=0, le=300, description="연결 타임아웃 (초)")
     is_enabled: Optional[bool] = Field(None, description="서버 활성화 상태")
     jwt_auth_required: Optional[bool] = Field(None, description="JWT 인증 필요 여부")
+    # SSE 서버 전용 필드
+    transport_type: Optional[str] = Field(None, description="전송 방식: stdio 또는 sse")
+    url: Optional[str] = Field(None, description="SSE 서버 URL (sse 방식)")
+    headers: Optional[Dict[str, str]] = Field(None, description="HTTP 헤더 (sse 방식)")
+    description: Optional[str] = Field(None, description="서버 설명")
 
 
 class McpServerResponse(BaseModel):
     id: str
     name: str
-    command: str
+    command: Optional[str]  # SSE 서버는 command가 없을 수 있음
     args: List[str]
     env: Dict[str, str]
     timeout: int
@@ -65,6 +76,12 @@ class McpServerResponse(BaseModel):
     status: str = "unknown"  # online, offline, error, disabled
     tools_count: int = 0
     
+    # SSE 서버 전용 필드
+    transport_type: str = "stdio"
+    url: Optional[str] = None
+    headers: Optional[Dict[str, str]] = None
+    description: Optional[str] = None
+    
     class Config:
         from_attributes = True
 
@@ -72,7 +89,7 @@ class McpServerResponse(BaseModel):
 class McpServerDetailResponse(BaseModel):
     id: str
     name: str
-    command: str
+    command: Optional[str]  # SSE 서버는 command가 없을 수 있음
     args: List[str]
     env: Dict[str, str]
     timeout: int
@@ -89,6 +106,12 @@ class McpServerDetailResponse(BaseModel):
     status: str = "unknown"  # online, offline, error, disabled
     tools_count: int = 0
     tools: List[Dict[str, Any]] = Field(default_factory=list)  # 툴 목록 추가
+    
+    # SSE 서버 전용 필드
+    transport_type: str = "stdio"
+    url: Optional[str] = None
+    headers: Optional[Dict[str, str]] = None
+    description: Optional[str] = None
     
     class Config:
         from_attributes = True
@@ -138,14 +161,47 @@ async def get_server_status(server: McpServer) -> Dict[str, Any]:
                 "response_time_ms": None
             }
         
-        # 서버 설정 준비
-        server_config = {
-            "command": server.command,
-            "args": server.args or [],
-            "env": server.env or {},
-            "timeout": server.timeout,
-            "is_enabled": server.is_enabled
-        }
+        # 서버 설정 준비 (transport type에 따라 다르게 구성)
+        if server.transport_type == "sse":
+            # SSE URL 동적 구성
+            sse_url = server.url
+            
+            # SSE 브리지 서버인지 확인 (command가 있으면 stdio 백엔드가 있는 브리지)
+            is_bridge = bool(server.command)
+            
+            if is_bridge:
+                # 브리지 서버: 내부 SSE 브리지 엔드포인트 사용
+                sse_url = f"http://localhost:8000/projects/{server.project_id}/servers/{server.name}/bridge/sse"
+                logger.info(f"🌉 Using SSE bridge endpoint for {server.name}: {sse_url}")
+            elif not sse_url or "localhost:8000" in sse_url:
+                # URL이 없거나 잘못된 경우 기본 브리지 엔드포인트 사용
+                sse_url = f"http://localhost:8000/projects/{server.project_id}/servers/{server.name}/bridge/sse"
+                logger.info(f"📝 Constructing SSE bridge URL for {server.name}: {sse_url}")
+            else:
+                # 외부 SSE 서버: 제공된 URL 사용
+                logger.info(f"🌐 Using external SSE URL for {server.name}: {sse_url}")
+            
+            server_config = {
+                "id": str(server.id),  # 서버 ID 추가
+                "transport_type": "sse",
+                "url": sse_url,
+                "headers": server.headers or {},
+                "timeout": server.timeout,
+                "is_enabled": server.is_enabled,
+                "command": server.command,  # stdio 백엔드 정보 포함
+                "args": server.args or [],
+                "env": server.env or {}
+            }
+        else:
+            server_config = {
+                "id": str(server.id),  # 서버 ID 추가
+                "transport_type": "stdio",
+                "command": server.command,
+                "args": server.args or [],
+                "env": server.env or {},
+                "timeout": server.timeout,
+                "is_enabled": server.is_enabled
+            }
         
         start_time = datetime.utcnow()
         
@@ -161,13 +217,24 @@ async def get_server_status(server: McpServer) -> Dict[str, Any]:
         
         if status == "online":
             try:
-                tools = await mcp_connection_service.get_server_tools(str(server.id), server_config)
-                logger.debug(f"✅ Retrieved {len(tools)} tools for server {server.id}")
+                logger.info(f"🔧 Getting tools for {server.transport_type} server {server.id} ({server.name})")
+                tools = await mcp_connection_service.get_server_tools(str(server.id), server_config, project_id=server.project_id)
+                
+                if tools:
+                    logger.info(f"✅ Retrieved {len(tools)} tools for server {server.id} ({server.name})")
+                    # 도구 이름 로깅 (디버깅용)
+                    tool_names = [tool.get('name', 'unknown') for tool in tools[:5]]  # 처음 5개만
+                    if tool_names:
+                        logger.info(f"   Sample tools: {', '.join(tool_names)}")
+                else:
+                    logger.warning(f"⚠️ No tools returned for server {server.id} ({server.name})")
+                    
             except Exception as tool_error:
-                logger.warning(f"⚠️ Could not retrieve tools for server {server.id}: {tool_error}")
+                logger.error(f"❌ Could not retrieve tools for server {server.id}: {tool_error}", exc_info=True)
                 error_message = f"Status online but tools unavailable: {str(tool_error)}"
         elif status == "error":
             error_message = "Server connection failed"
+            logger.warning(f"⚠️ Server {server.id} ({server.name}) is in error state")
         
         return {
             "status": status,
@@ -268,7 +335,11 @@ async def list_project_servers(
                 last_used_at=server.last_used_at,
                 jwt_auth_required=server.get_effective_jwt_auth_required(),
                 status=status_info["status"],
-                tools_count=len(status_info["tools"])
+                tools_count=len(status_info["tools"]),
+                transport_type=server.transport_type or "stdio",
+                url=server.url,
+                headers=server.headers if server.transport_type == "sse" else None,
+                description=server.description
             )
         except asyncio.TimeoutError:
             logger.warning(f"⏱️ Timeout getting status for server {server.id}")
@@ -293,7 +364,11 @@ async def list_project_servers(
             last_used_at=server.last_used_at,
             jwt_auth_required=server.get_effective_jwt_auth_required(),
             status=status,
-            tools_count=0
+            tools_count=0,
+            transport_type=server.transport_type or "stdio",
+            url=server.url,
+            headers=server.headers if server.transport_type == "sse" else None,
+            description=server.description
         )
     
     # 모든 서버의 상태를 병렬로 확인 (최대 15초 전체 타임아웃)
@@ -354,17 +429,49 @@ async def create_project_server(
             detail=f"Server with name '{server_data.name}' already exists in this project"
         )
     
+    # transport_type에 따른 검증
+    transport_type = server_data.transport_type or "stdio"
+    command = None
+    url = None
+    
+    if transport_type == "sse":
+        # SSE 서버는 URL이 필수
+        if not server_data.url:
+            # URL이 없으면 자동 생성 (내부 SSE 브리지 사용)
+            url = f"http://localhost:8000/projects/{project_id}/servers/{server_data.name}/sse"
+            logger.info(f"📝 Auto-generated SSE URL for internal bridge: {url}")
+        else:
+            url = server_data.url
+        # SSE 서버는 command가 필요없음
+        command = None
+    else:
+        # stdio 서버는 command가 필수
+        if not server_data.command:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Command is required for stdio servers"
+            )
+        command = server_data.command
+        url = None
+    
     # 새 서버 생성
     new_server = McpServer(
         name=server_data.name,
-        command=server_data.command,
+        command=command,  # transport_type에 따라 None 또는 실제 command
         args=server_data.args or [],
         env=server_data.env or {},
         timeout=server_data.timeout,
         is_enabled=server_data.is_enabled,
+        transport_type=transport_type,  # transport_type 저장
+        url=url,  # SSE인 경우 URL 저장
+        description=server_data.description,  # description 저장
         project_id=project_id,
         created_by_id=current_user.id
     )
+    
+    # SSE 서버인 경우 headers 설정 (암호화됨)
+    if transport_type == "sse" and server_data.headers:
+        new_server.headers = server_data.headers
     
     db.add(new_server)
     db.commit()
@@ -377,11 +484,13 @@ async def create_project_server(
             user_id=current_user.id,
             project_id=project_id,
             action="server_created",
-            description=f"MCP 서버 '{server_data.name}' 생성",
+            description=f"MCP 서버 '{server_data.name}' 생성 ({transport_type})",
             meta_data={
                 "server_id": str(new_server.id),
                 "server_name": server_data.name,
-                "command": server_data.command
+                "command": command,
+                "transport_type": transport_type,
+                "url": url if transport_type == "sse" else None
             }
         )
     except Exception as e:
@@ -410,7 +519,11 @@ async def create_project_server(
         last_used_at=new_server.last_used_at,
         jwt_auth_required=new_server.get_effective_jwt_auth_required(),
         status=status_info["status"],
-        tools_count=len(status_info["tools"])
+        tools_count=len(status_info["tools"]),
+        transport_type=new_server.transport_type or "stdio",
+        url=new_server.url,
+        headers=new_server.headers if new_server.transport_type == "sse" else None,  # DB에서 복호화된 headers 사용
+        description=new_server.description
     )
 
 
@@ -460,7 +573,12 @@ async def get_project_server_detail(
         jwt_auth_required=server.get_effective_jwt_auth_required(),
         status=status_info["status"],
         tools_count=len(status_info["tools"]),
-        tools=status_info["tools"]  # 툴 목록도 포함
+        tools=status_info["tools"],  # 툴 목록도 포함
+        # SSE 서버 관련 필드 추가
+        transport_type=server.transport_type or "stdio",
+        url=server.url,
+        headers=server.headers if server.transport_type == "sse" else None,
+        description=server.description
     )
 
 
@@ -506,6 +624,30 @@ async def update_project_server(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Server with name '{server_data.name}' already exists in this project"
             )
+    
+    # transport_type 변경 시 검증
+    if 'transport_type' in update_data:
+        new_transport = update_data['transport_type']
+        if new_transport == 'sse':
+            # SSE로 변경하는 경우
+            if 'url' in update_data:
+                server.url = update_data['url']
+            elif not server.url:
+                # URL이 없으면 자동 생성
+                server.url = f"http://localhost:8000/projects/{project_id}/servers/{server.name}/sse"
+                logger.info(f"📝 Auto-generated SSE URL for server update: {server.url}")
+            # SSE 서버는 command 제거
+            server.command = None
+        else:
+            # stdio로 변경하는 경우
+            if 'command' not in update_data and not server.command:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Command is required when changing to stdio transport"
+                )
+            # stdio 서버는 URL 제거
+            server.url = None
+            server.headers = {}
     
     # 필드 업데이트
     old_values = {}
@@ -560,7 +702,11 @@ async def update_project_server(
         last_used_at=server.last_used_at,
         jwt_auth_required=server.get_effective_jwt_auth_required(),
         status=status_info["status"],
-        tools_count=len(status_info["tools"])
+        tools_count=len(status_info["tools"]),
+        transport_type=server.transport_type or "stdio",
+        url=server.url,
+        headers=server.headers if server.transport_type == "sse" else None,
+        description=server.description
     )
 
 

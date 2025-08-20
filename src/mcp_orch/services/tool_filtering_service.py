@@ -42,6 +42,12 @@ class ToolFilteringService:
         """
         start_time = time.time()
         
+        # 🔧 디버그 모드: 환경 변수로 필터링 비활성화 (임시)
+        import os
+        if os.getenv('DISABLE_TOOL_FILTERING', '').lower() in ('true', '1', 'yes'):
+            logger.info(f"🔧 [DEBUG] Tool filtering disabled by environment variable - returning all {len(tools)} tools")
+            return tools
+        
         # 🔄 ServerStatusService와 동일한 DB 세션 관리 패턴
         should_close_db = False
         if db is None:
@@ -49,6 +55,12 @@ class ToolFilteringService:
             should_close_db = True
         
         try:
+            # 🔍 디버깅: 입력 매개변수 로깅
+            logger.info(f"🔍 [DEBUG] Filtering tools for project_id={project_id}, server_id={server_id}, tool_count={len(tools)}")
+            if tools:
+                tool_names = [tool.get('name', 'unknown') for tool in tools[:3]]
+                logger.info(f"🔍 [DEBUG] Sample tool names: {tool_names}")
+            
             # 툴 설정 조회 (배치 쿼리 최적화)
             tool_preferences = db.query(ToolPreference).filter(
                 and_(
@@ -56,6 +68,11 @@ class ToolFilteringService:
                     ToolPreference.server_id == server_id
                 )
             ).all()
+            
+            # 🔍 디버깅: 조회된 설정 로깅
+            logger.info(f"🔍 [DEBUG] Found {len(tool_preferences)} tool preferences in database")
+            for pref in tool_preferences[:5]:  # 처음 5개만 로깅
+                logger.info(f"🔍 [DEBUG] Preference: {pref.tool_name} = {pref.is_enabled}")
             
             # 빠른 조회를 위한 설정 맵 생성
             preference_map = {
@@ -71,11 +88,14 @@ class ToolFilteringService:
                 tool_name = tool.get('name', '')
                 is_enabled = preference_map.get(tool_name, True)  # 기본값: 사용함
                 
+                # 🔍 디버깅: 각 도구별 결정 로깅
+                logger.debug(f"🔍 [DEBUG] Tool '{tool_name}': preference={preference_map.get(tool_name, 'default_true')}, enabled={is_enabled}")
+                
                 if is_enabled:
                     filtered_tools.append(tool)
                 else:
                     filtered_count += 1
-                    logger.debug(f"🚫 Tool filtered: {tool_name} from server {server_id}")
+                    logger.info(f"🚫 Tool filtered: {tool_name} from server {server_id} (explicitly disabled)")
             
             # 📊 ServerStatusService 스타일 메트릭 로깅
             filtering_time = (time.time() - start_time) * 1000  # 밀리초

@@ -183,7 +183,26 @@ class McpSessionManager:
         return session
     
     async def _create_new_session(self, server_id: str, server_config: Dict) -> McpSession:
-        """새 MCP 세션 생성 - stdio_client 패턴"""
+        """새 MCP 세션 생성 - stdio/SSE 패턴 모두 지원"""
+        transport_type = server_config.get('transport_type', 'stdio')
+        
+        if transport_type == 'sse':
+            # SSE 서버는 별도 처리 - 더미 세션 객체 생성
+            logger.info(f"🌐 Creating SSE session placeholder for server {server_id}")
+            # SSE는 process가 없으므로 None으로 설정하고 더미 스트림 사용
+            session = McpSession(
+                server_id=server_id,
+                process=None,  # SSE는 프로세스가 없음
+                read_stream=None,  # SSE는 HTTP 기반
+                write_stream=None,  # SSE는 HTTP 기반
+                session_id=f"sse_{server_id}_{int(time.time())}",
+                created_at=datetime.utcnow(),
+                last_used_at=datetime.utcnow(),
+                is_initialized=True  # SSE는 별도 초기화 불필요
+            )
+            return session
+        
+        # stdio 서버 처리 (기존 로직)
         command = server_config.get('command', '')
         args = server_config.get('args', [])
         env = server_config.get('env', {})
@@ -232,8 +251,14 @@ class McpSessionManager:
         return session
     
     async def initialize_session(self, session: McpSession) -> None:
-        """MCP 세션 초기화 (재시도 메커니즘 포함)"""
+        """MCP 세션 초기화 - stdio/SSE 모두 지원 (재시도 메커니즘 포함)"""
         if session.is_initialized:
+            return
+        
+        # SSE 세션의 경우 초기화 건너뛰기
+        if session.process is None:
+            logger.info(f"🌐 SSE session - skipping initialization for server {session.server_id}")
+            session.is_initialized = True
             return
             
         async with session.initialization_lock:
@@ -436,7 +461,7 @@ class McpSessionManager:
         ip_address: Optional[str] = None,
         db: Optional[Session] = None
     ) -> Dict:
-        """단일 MCP 도구 호출 (재시도 로직 없음)"""
+        """단일 MCP 도구 호출 (재시도 로직 없음) - stdio/SSE 방식 모두 지원"""
         start_time = time.time()
         
         # 프로젝트 ID 변환
@@ -472,61 +497,18 @@ class McpSessionManager:
             if not server_config.get('is_enabled', True):
                 raise ValueError(f"Server {server_id} is disabled")
             
-            # 세션 가져오기 또는 생성
-            session = await self.get_or_create_session(server_id, server_config)
+            # 🆕 transport_type에 따라 처리 방식 분기
+            transport_type = server_config.get('transport_type', 'stdio')
             
-            # 세션 초기화 (필요시)
-            await self.initialize_session(session)
-            
-            # 도구 호출 메시지 생성
-            message_id = self._get_next_message_id()
-            tool_message = {
-                "jsonrpc": "2.0",
-                "id": message_id,
-                "method": "tools/call",
-                "params": {
-                    "name": tool_name
-                }
-            }
-            
-            # arguments가 비어있지 않은 경우에만 추가
-            if arguments:
-                tool_message["params"]["arguments"] = arguments
+            if transport_type == 'sse':
+                # SSE 서버는 별도 처리
+                logger.info(f"🌐 Calling tool {tool_name} on SSE server {server_id}")
+                result = await self._call_sse_tool(server_id, server_config, tool_name, arguments)
             else:
-                # 일부 MCP 서버는 빈 arguments를 기대하므로 명시적으로 추가
-                tool_message["params"]["arguments"] = {}
+                # stdio 서버는 기존 세션 기반 처리
+                logger.info(f"📡 Calling tool {tool_name} on stdio server {server_id}")
+                result = await self._call_stdio_tool(server_id, server_config, tool_name, arguments)
             
-            logger.info(f"🔧 Sending tool call message: {json.dumps(tool_message)}")
-            
-            # 메시지 전송
-            await self._send_message(session, tool_message)
-            logger.info(f"📤 Sent tool call message for {tool_name} (ID: {tool_message['id']})")
-            
-            # 응답 대기 (메시지 ID 매칭)
-            timeout = server_config.get('timeout', 60)
-            response = await self._read_message(session, timeout=timeout, expected_id=tool_message['id'])
-            
-            # 응답 디버깅
-            if not response:
-                logger.error(f"❌ No response received for tool call {tool_name} (ID: {tool_message['id']})")
-                raise ToolExecutionError("No response received from MCP server")
-            
-            logger.info(f"📥 Received response for {tool_name}: ID={response.get('id')}, expected={tool_message['id']}")
-            logger.info(f"📥 Full response content: {json.dumps(response)}")
-            
-            if response.get('id') != tool_message['id']:
-                logger.error(f"❌ Message ID mismatch: expected {tool_message['id']}, got {response.get('id')}")
-                raise ToolExecutionError(f"Message ID mismatch: expected {tool_message['id']}, got {response.get('id')}")
-            
-            if 'error' in response:
-                error_msg = response['error'].get('message', 'Unknown error')
-                logger.error(f"❌ Tool call error: {error_msg}")
-                raise ToolExecutionError(f"Tool execution failed: {error_msg}")
-            
-            if 'result' not in response:
-                raise ToolExecutionError("No result in tool call response")
-            
-            result = response['result']
             execution_time = (time.time() - start_time) * 1000  # 밀리초
             
             # 성공 로그 저장
@@ -535,9 +517,6 @@ class McpSessionManager:
                     db, log_data, execution_time, CallStatus.SUCCESS, 
                     {'result': result}
                 )
-            
-            # 세션 사용 시간 업데이트
-            session.last_used_at = datetime.utcnow()
             
             logger.info(f"✅ Tool {tool_name} executed successfully in {execution_time:.2f}ms")
             return result
@@ -553,8 +532,189 @@ class McpSessionManager:
             logger.error(f"❌ Error calling tool {tool_name} on server {server_id}: {e}")
             raise
     
-    async def get_server_tools(self, server_id: str, server_config: Dict) -> List[Dict]:
-        """서버 도구 목록 조회 - 캐시된 결과 사용 + 툴 필터링 적용"""
+    async def _call_sse_tool(self, server_id: str, server_config: Dict, tool_name: str, arguments: Dict) -> Dict:
+        """SSE 서버 도구 호출"""
+        try:
+            # SSEMCPServer 인스턴스 생성 및 사용
+            from ..core.sse_server import SSEMCPServer, SSEServerConfig
+            
+            # SSE 서버 설정 생성
+            sse_config = SSEServerConfig(
+                name=server_id,
+                url=server_config.get('url', ''),
+                headers=server_config.get('headers', {}),
+                timeout=server_config.get('timeout', 30),
+                disabled=not server_config.get('is_enabled', True)
+            )
+            
+            # SSE 서버 인스턴스 생성
+            sse_server = SSEMCPServer(sse_config)
+            
+            try:
+                # SSE 서버 시작 (초기화 포함)
+                await sse_server.start(skip_initialization=False)
+                
+                # 도구 호출
+                result = await sse_server.call_tool(tool_name, arguments)
+                logger.info(f"✅ SSE tool call completed: {tool_name}")
+                return result
+                
+            finally:
+                # SSE 서버 정리
+                if sse_server.is_connected:
+                    await sse_server.stop()
+                    
+        except Exception as e:
+            logger.error(f"❌ Error calling SSE tool {tool_name}: {e}")
+            raise ToolExecutionError(f"SSE tool execution failed: {e}")
+    
+    async def _call_stdio_tool(self, server_id: str, server_config: Dict, tool_name: str, arguments: Dict) -> Dict:
+        """stdio 서버 도구 호출 (기존 로직)"""
+        # 세션 가져오기 또는 생성
+        session = await self.get_or_create_session(server_id, server_config)
+        
+        # 세션 초기화 (필요시)
+        await self.initialize_session(session)
+        
+        # 도구 호출 메시지 생성
+        message_id = self._get_next_message_id()
+        tool_message = {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name
+            }
+        }
+        
+        # arguments가 비어있지 않은 경우에만 추가
+        if arguments:
+            tool_message["params"]["arguments"] = arguments
+        else:
+            # 일부 MCP 서버는 빈 arguments를 기대하므로 명시적으로 추가
+            tool_message["params"]["arguments"] = {}
+        
+        logger.info(f"🔧 Sending tool call message: {json.dumps(tool_message)}")
+        
+        # 메시지 전송
+        await self._send_message(session, tool_message)
+        logger.info(f"📤 Sent tool call message for {tool_name} (ID: {tool_message['id']})")
+        
+        # 응답 대기 (메시지 ID 매칭)
+        timeout = server_config.get('timeout', 60)
+        response = await self._read_message(session, timeout=timeout, expected_id=tool_message['id'])
+        
+        # 응답 디버깅
+        if not response:
+            logger.error(f"❌ No response received for tool call {tool_name} (ID: {tool_message['id']})")
+            raise ToolExecutionError("No response received from MCP server")
+        
+        logger.info(f"📥 Received response for {tool_name}: ID={response.get('id')}, expected={tool_message['id']}")
+        logger.info(f"📥 Full response content: {json.dumps(response)}")
+        
+        if response.get('id') != tool_message['id']:
+            logger.error(f"❌ Message ID mismatch: expected {tool_message['id']}, got {response.get('id')}")
+            raise ToolExecutionError(f"Message ID mismatch: expected {tool_message['id']}, got {response.get('id')}")
+        
+        if 'error' in response:
+            error_msg = response['error'].get('message', 'Unknown error')
+            logger.error(f"❌ Tool call error: {error_msg}")
+            raise ToolExecutionError(f"Tool execution failed: {error_msg}")
+        
+        if 'result' not in response:
+            raise ToolExecutionError("No result in tool call response")
+        
+        result = response['result']
+        
+        # 세션 사용 시간 업데이트
+        session.last_used_at = datetime.utcnow()
+        
+        return result
+    
+    async def get_server_tools(self, server_id: str, server_config: Dict, project_id: Optional[UUID] = None) -> List[Dict]:
+        """서버 도구 목록 조회 - stdio/SSE 방식 모두 지원 + 툴 필터링 적용"""
+        try:
+            # 🆕 transport_type에 따라 처리 방식 분기
+            transport_type = server_config.get('transport_type', 'stdio')
+            
+            if transport_type == 'sse':
+                # SSE 서버는 별도 처리
+                return await self._get_sse_server_tools(server_id, server_config, project_id)
+            else:
+                # stdio 서버는 기존 세션 기반 처리
+                return await self._get_stdio_server_tools(server_id, server_config, project_id)
+                
+        except Exception as e:
+            logger.error(f"❌ Error getting tools for server {server_id}: {e}")
+            return []
+    
+    async def _get_sse_server_tools(self, server_id: str, server_config: Dict, project_id: Optional[UUID] = None) -> List[Dict]:
+        """SSE 서버 도구 목록 조회"""
+        try:
+            logger.info(f"🌐 Getting tools from SSE server {server_id}")
+            
+            # SSEMCPServer 인스턴스 생성 및 사용
+            from ..core.sse_server import SSEMCPServer, SSEServerConfig
+            
+            # SSE 서버 설정 생성
+            sse_config = SSEServerConfig(
+                name=server_id,
+                url=server_config.get('url', ''),
+                headers=server_config.get('headers', {}),
+                timeout=server_config.get('timeout', 30),
+                disabled=not server_config.get('is_enabled', True)
+            )
+            
+            # SSE 서버 인스턴스 생성
+            sse_server = SSEMCPServer(sse_config)
+            
+            try:
+                # 🆕 일원화된 SSE 처리: 모든 SSE 서버를 독립적인 외부 서버로 처리
+                logger.info(f"🌐 Connecting to SSE server {server_id} at {sse_config.url}")
+                
+                await sse_server.start(skip_initialization=False)
+                tools = sse_server.tools
+                logger.info(f"✅ Retrieved {len(tools)} tools from SSE server {server_id}")
+                
+                # 🆕 project_id 우선 사용: API에서 전달된 project_id가 있으면 우선 사용
+                if project_id:
+                    # API에서 project_id가 전달된 경우 (외부 SSE 서버)
+                    resolved_project_id = project_id
+                    actual_server_id = UUID(server_id) if isinstance(server_id, str) else server_id
+                    logger.info(f"🔍 [DEBUG] Using provided project_id for SSE server: project_id={resolved_project_id}, server_id={actual_server_id}")
+                else:
+                    # 기존 server_id 해석 로직 사용 (내부 브리지 서버)
+                    resolved_project_id, actual_server_id = self._resolve_server_id(server_id)
+                    logger.info(f"🔍 [DEBUG] Resolved from server_id: {server_id} -> project_id={resolved_project_id}, actual_server_id={actual_server_id}")
+                
+                # 🆕 도구 필터링 적용
+                filtered_tools = tools
+                if resolved_project_id and actual_server_id:
+                    from .tool_filtering_service import ToolFilteringService
+                    filtered_tools = await ToolFilteringService.filter_tools_by_preferences(
+                        project_id=resolved_project_id,
+                        server_id=actual_server_id,
+                        tools=tools,
+                        db=None  # 세션 매니저에서는 별도 DB 세션 관리
+                    )
+                    logger.info(f"🎯 Applied filtering to SSE tools: {len(filtered_tools)}/{len(tools)} tools enabled")
+                else:
+                    logger.warning(f"⚠️ Skipping tool filtering due to missing IDs: project_id={resolved_project_id}, server_id={actual_server_id}")
+                
+                logger.info(f"✅ Retrieved {len(filtered_tools)} filtered tools from SSE server {server_id}")
+                return filtered_tools
+                
+            finally:
+                # SSE 서버 정리
+                if sse_server.is_connected:
+                    await sse_server.stop()
+                
+        except Exception as e:
+            logger.error(f"❌ Error getting tools from SSE server {server_id}: {e}")
+            return []
+    
+    async def _get_stdio_server_tools(self, server_id: str, server_config: Dict, project_id: Optional[UUID] = None) -> List[Dict]:
+        """stdio 서버 도구 목록 조회 (기존 로직)"""
         try:
             # 세션 가져오기 또는 생성
             session = await self.get_or_create_session(server_id, server_config)
@@ -562,24 +722,34 @@ class McpSessionManager:
             # 세션 초기화 (필요시)
             await self.initialize_session(session)
             
-            # 🆕 server_id 해석: "project_id.server_name" 형식 또는 UUID
-            project_id, actual_server_id = self._resolve_server_id(server_id)
+            # 🆕 project_id 우선 사용: API에서 전달된 project_id가 있으면 우선 사용
+            if project_id:
+                # API에서 project_id가 전달된 경우
+                resolved_project_id = project_id
+                actual_server_id = UUID(server_id) if isinstance(server_id, str) else server_id
+                logger.info(f"🔍 [DEBUG] Using provided project_id for stdio server: project_id={resolved_project_id}, server_id={actual_server_id}")
+            else:
+                # 기존 server_id 해석 로직 사용
+                resolved_project_id, actual_server_id = self._resolve_server_id(server_id)
+                logger.info(f"🔍 [DEBUG] Resolved from server_id: {server_id} -> project_id={resolved_project_id}, actual_server_id={actual_server_id}")
             
             # 캐시된 도구 목록이 있으면 필터링 후 반환
             if session.tools_cache is not None:
                 logger.info(f"📋 Using cached tools for server {server_id}")
                 
                 # 🆕 캐시된 도구에 실시간 필터링 적용
-                if project_id and actual_server_id:
+                if resolved_project_id and actual_server_id:
                     from .tool_filtering_service import ToolFilteringService
                     filtered_tools = await ToolFilteringService.filter_tools_by_preferences(
-                        project_id=project_id,
+                        project_id=resolved_project_id,
                         server_id=actual_server_id,
                         tools=session.tools_cache,
                         db=None  # 세션 매니저에서는 별도 DB 세션 관리
                     )
                     logger.info(f"🎯 Applied filtering to cached tools: {len(filtered_tools)}/{len(session.tools_cache)} tools enabled")
                     return filtered_tools
+                else:
+                    logger.warning(f"⚠️ Skipping cached tool filtering due to missing IDs: project_id={resolved_project_id}, server_id={actual_server_id}")
                 
                 return session.tools_cache
             
@@ -618,15 +788,17 @@ class McpSessionManager:
             
             # 🆕 새로 조회한 도구에 필터링 적용
             filtered_tools = tools
-            if project_id and actual_server_id:
+            if resolved_project_id and actual_server_id:
                 from .tool_filtering_service import ToolFilteringService
                 filtered_tools = await ToolFilteringService.filter_tools_by_preferences(
-                    project_id=project_id,
+                    project_id=resolved_project_id,
                     server_id=actual_server_id,
                     tools=tools,
                     db=None  # 세션 매니저에서는 별도 DB 세션 관리
                 )
                 logger.info(f"🎯 Applied filtering to new tools: {len(filtered_tools)}/{len(tools)} tools enabled")
+            else:
+                logger.warning(f"⚠️ Skipping new tool filtering due to missing IDs: project_id={resolved_project_id}, server_id={actual_server_id}")
             
             # 🆕 필터링된 도구를 캐시에 저장 (원본 대신 필터링된 결과)
             session.tools_cache = filtered_tools
@@ -749,8 +921,14 @@ class McpSessionManager:
             raise
     
     async def _is_session_alive(self, session: McpSession) -> bool:
-        """세션이 살아있는지 확인"""
+        """세션이 살아있는지 확인 - stdio/SSE 모두 지원"""
         try:
+            # SSE 세션의 경우 process가 None이므로 다르게 처리
+            if session.process is None:
+                # SSE 세션은 항상 "alive"로 간주 (실제 연결 테스트는 요청 시점에)
+                return True
+            
+            # stdio 세션의 경우 프로세스 상태 확인
             if session.process.returncode is not None:
                 return False
             
@@ -761,18 +939,22 @@ class McpSessionManager:
             return False
     
     async def _close_session(self, session: McpSession) -> None:
-        """세션 종료"""
+        """세션 종료 - stdio/SSE 모두 지원"""
         try:
             logger.info(f"🔴 Closing session for server {session.server_id}")
             
-            # 프로세스 종료
-            if session.process.returncode is None:
-                session.process.terminate()
-                try:
-                    await asyncio.wait_for(session.process.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    session.process.kill()
-                    await session.process.wait()
+            # SSE 세션의 경우 process가 None이므로 별도 처리
+            if session.process is None:
+                logger.info(f"🌐 SSE session closed for server {session.server_id}")
+            else:
+                # stdio 세션의 경우 프로세스 종료
+                if session.process.returncode is None:
+                    session.process.terminate()
+                    try:
+                        await asyncio.wait_for(session.process.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        session.process.kill()
+                        await session.process.wait()
             
             # 스트림 정리
             if session.write_stream and not session.write_stream.is_closing():
