@@ -221,12 +221,10 @@ async def mcp_sse_bridge_endpoint(
                 read_stream, write_stream = streams
                 logger.info(f"✅ SSE streams established for {server_name}")
                 
-                # 초기 연결 안정화를 위한 짧은 지연
-                # 클라이언트가 SSE 스트림을 완전히 설정할 시간 제공
-                await asyncio.sleep(0.1)
-                logger.info(f"📡 SSE stream stabilized, starting MCP session for {server_name}")
+                # 즉시 연결 상태 알림 - 클라이언트 타임아웃 방지
+                logger.info(f"📡 Starting MCP session immediately for {server_name}")
                 
-                # MCP 서버 세션 실행
+                # MCP 서버 세션 실행 (지연 제거로 응답성 향상)
                 await run_mcp_bridge_session(
                     read_stream, 
                     write_stream, 
@@ -797,7 +795,8 @@ async def run_mcp_bridge_session(
             server_version="1.0.0",
             capabilities=mcp_server.create_initialization_options().capabilities
         )
-        logger.info(f"   Initialization options: {init_options}")
+        logger.info(f"   Initialization options: server_name={init_options.server_name}, server_version={init_options.server_version}")
+        logger.info(f"🚀 Starting MCP server.run() for {server_name} - connection ready for client")
         
         # MCP 서버 실행 (Server.run이 초기화 시퀀스를 자동 처리)
         await mcp_server.run(
@@ -818,10 +817,13 @@ async def run_mcp_bridge_session(
         try:
             if client_session and db:
                 try:
+                    # 세션 지속 시간 계산
+                    session_duration = (datetime.utcnow() - client_session.created_at).total_seconds()
+                    
                     client_session.status = 'inactive'
                     client_session.updated_at = datetime.utcnow()
                     db.commit()
-                    logger.info(f"🔌 ClientSession {session_id} disconnected")
+                    logger.info(f"🔌 ClientSession {session_id} disconnected after {session_duration:.1f}s")
                     
                     # ServerLog에 연결 종료 이벤트 기록 (별도 DB 세션 사용)
                     # 중요: context manager 대신 try-finally로 확실한 정리 보장
@@ -834,12 +836,14 @@ async def run_mcp_bridge_session(
                             project_id=project_id,
                             level=LogLevel.INFO,
                             category=LogCategory.CONNECTION,
-                            message=f"Client session ended: {client_type} client disconnected",
+                            message=f"Client session ended: {client_type} client disconnected after {session_duration:.1f}s",
                             details={
                                 "session_id": session_id,
                                 "client_type": client_type,
+                                "session_duration_seconds": session_duration,
                                 "total_requests": client_session.total_requests,
-                                "failed_requests": client_session.failed_requests
+                                "failed_requests": client_session.failed_requests,
+                                "disconnect_reason": "client_timeout" if session_duration < 10 else "normal"
                             }
                         )
                         log_db.commit()  # 명시적 commit
