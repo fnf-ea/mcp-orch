@@ -95,12 +95,23 @@ class ToolRegistry:
                     logger.warning(f"Failed to build config for database server: {db_server.name}")
                     continue
                 
+                # SSE 서버는 command가 없을 수 있으므로 건너뛰기
+                transport_type = config.get("transport_type", "stdio")
+                if transport_type == "sse":
+                    logger.info(f"Skipping SSE server {db_server.name} - managed by SSE bridge")
+                    continue
+                
+                # stdio 서버만 ServerInfo로 등록
+                if not config.get("command"):
+                    logger.warning(f"Skipping server {db_server.name} - no command specified")
+                    continue
+                
                 server_info = ServerInfo(
                     name=db_server.name,
                     command=config["command"],
-                    args=config["args"],
+                    args=config.get("args", []),
                     env=config.get("env", {}),
-                    transport_type=config.get("transportType", "stdio"),
+                    transport_type=transport_type,
                     timeout=config.get("timeout", 60),
                     auto_approve=[],
                     disabled=config.get("disabled", False)
