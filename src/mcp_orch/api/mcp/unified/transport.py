@@ -289,13 +289,30 @@ class UnifiedMCPTransport(MCPSSETransport):
     def _build_server_config_for_server(self, server: McpServer) -> Optional[Dict[str, Any]]:
         """Build server configuration for MCP connection service"""
         try:
-            return {
-                "command": server.command,
-                "args": server.args or [],
-                "env": server.env or {},
+            config = {
                 "timeout": server.timeout,
-                "is_enabled": server.is_enabled
+                "is_enabled": server.is_enabled,
+                "transport_type": server.transport_type  # 🆕 SSE/stdio 구분을 위한 transport_type 추가
             }
+            
+            # SSE 서버와 stdio 서버 구분하여 설정 구성
+            if server.is_sse_server():
+                # SSE 서버 설정
+                config.update({
+                    "url": server.url,
+                    "headers": server.headers or {},
+                })
+                logger.debug(f"🌐 Built SSE server config for {server.name}: url={server.url}")
+            else:
+                # stdio 서버 설정
+                config.update({
+                    "command": server.command,
+                    "args": server.args or [],
+                    "env": server.env or {},
+                })
+                logger.debug(f"💻 Built stdio server config for {server.name}: command={server.command}")
+            
+            return config
         except Exception as e:
             logger.error(f"Failed to build config for server {server.name}: {e}")
             return None

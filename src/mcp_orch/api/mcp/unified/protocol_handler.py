@@ -111,7 +111,7 @@ class UnifiedProtocolHandler:
                 
                 # Get tools from server
                 tools = await mcp_connection_service.get_server_tools(
-                    str(server.id), server_config
+                    str(server.id), server_config, project_id=str(self.transport.project_id)
                 )
                 
                 if tools is None:
