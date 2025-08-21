@@ -471,16 +471,76 @@ async def run_mcp_bridge_session(
                 tool_list.append(test_tool)
                 logger.info(f"  - Added test tool: sse_bridge_test")
                 
-                # 브리지 서버가 stdio 서버의 프록시 역할을 하는 경우
-                # command가 설정되어 있을 때만 실제 stdio 서버 도구를 가져옴
-                if server_config.get('command'):
-                    logger.info(f"🔍 Bridge has stdio backend - loading tools from stdio server")
+                # 브리지 서버가 실제 MCP 서버의 프록시 역할을 하는 경우
+                transport_type = server_config.get('transportType', 'stdio')
+                logger.info(f"🔍 Server config: transport_type={transport_type}, command={server_config.get('command')}")
+                logger.info(f"   Full server_config: {server_config}")
+                
+                # SSE 서버와 stdio 서버 구분하여 처리
+                if transport_type == 'sse' or server_record.transport_type == 'sse':
+                    # SSE 서버의 경우 SSEMCPServer를 사용하여 도구 가져오기
+                    logger.info(f"🔍 Bridge loading tools from SSE MCP server")
+                    logger.info(f"   URL: {server_config.get('url')}")
+                    
+                    try:
+                        from ..core.sse_server import SSEMCPServer, SSEServerConfig
+                        
+                        # SSE 서버 설정 생성
+                        sse_config = SSEServerConfig(
+                            name=server_name,
+                            url=server_config.get('url', ''),
+                            headers=server_config.get('headers', {}),
+                            timeout=server_config.get('timeout', 30),
+                            disabled=not server_config.get('is_enabled', True)
+                        )
+                        
+                        # SSE 서버 인스턴스 생성 및 연결
+                        sse_server = SSEMCPServer(sse_config)
+                        await sse_server.start(skip_initialization=False)  # 초기화 및 도구 목록 조회 수행
+                        
+                        # SSE 서버에서 가져온 도구들
+                        if sse_server.tools:
+                            logger.info(f"📋 Loaded {len(sse_server.tools)} tools from SSE backend")
+                            
+                            # python-sdk 형식으로 변환
+                            for tool in sse_server.tools:
+                                # 도구 정보 추출
+                                tool_name = tool.get("name", "")
+                                tool_desc = tool.get("description", "")
+                                tool_schema = tool.get("inputSchema") or tool.get("schema") or {
+                                    "type": "object",
+                                    "properties": {},
+                                    "required": []
+                                }
+                                
+                                # 로그 출력
+                                logger.info(f"  - Converting tool: {tool_name}")
+                                logger.debug(f"    Schema: {tool_schema}")
+                                
+                                tool_obj = types.Tool(
+                                    name=tool_name,
+                                    description=tool_desc,
+                                    inputSchema=tool_schema
+                                )
+                                tool_list.append(tool_obj)
+                        else:
+                            logger.warning(f"⚠️ No tools returned from SSE backend")
+                        
+                        # SSE 서버 연결 종료
+                        await sse_server.stop()
+                        
+                    except Exception as sse_error:
+                        logger.error(f"❌ Failed to load SSE backend tools: {sse_error}", exc_info=True)
+                        # SSE 도구 로드 실패 시 계속 진행 (기본 도구만 사용)
+                        
+                elif server_config.get('command'):
+                    # stdio 서버의 경우 기존 방식 사용
+                    logger.info(f"🔍 Bridge loading tools from stdio MCP server")
                     logger.info(f"   Command: {server_config.get('command')}")
                     logger.info(f"   Args: {server_config.get('args', [])}")
                     
                     try:
                         # mcp_connection_service를 사용하여 도구 가져오기
-                        # 실제 서버 ID는 server_record.id를 사용
                         from ..services.mcp_connection_service import mcp_connection_service
                         
                         # stdio 서버 연결 및 도구 목록 가져오기
@@ -580,6 +640,27 @@ async def run_mcp_bridge_session(
                 logger.error(f"Error loading tools for SSE bridge {server_name}: {e}")
                 # 에러 시 빈 도구 목록 반환
                 return []
+        
+        # 리소스 목록 제공 (빈 목록 반환)
+        @mcp_server.list_resources()
+        async def list_resources():
+            logger.info(f"📚 Listing resources for SSE bridge server: {server_name}")
+            # SSE 브리지는 리소스를 제공하지 않음
+            return []
+        
+        # 리소스 템플릿 목록 제공 (빈 목록 반환)
+        @mcp_server.list_resource_templates()
+        async def list_resource_templates():
+            logger.info(f"📋 Listing resource templates for SSE bridge server: {server_name}")
+            # SSE 브리지는 리소스 템플릿을 제공하지 않음
+            return []
+        
+        # 프롬프트 목록 제공 (빈 목록 반환)
+        @mcp_server.list_prompts()
+        async def list_prompts():
+            logger.info(f"💭 Listing prompts for SSE bridge server: {server_name}")
+            # SSE 브리지는 프롬프트를 제공하지 않음
+            return []
         
         # 도구 실행을 실제 서버로 프록시
         @mcp_server.call_tool()
@@ -891,7 +972,10 @@ def _build_server_config_from_db(server: McpServer) -> Optional[Dict[str, Any]]:
             'args': server.args or [],
             'env': server.env or {},
             'timeout': server.timeout or 60,
-            'transportType': server.transport_type or 'stdio',
+            'transportType': server.transport_type or 'stdio',  # camelCase for compatibility
+            'transport_type': server.transport_type or 'stdio',  # snake_case for mcp_session_manager
+            'url': server.url,  # SSE 서버를 위한 URL 필드 추가
+            'headers': server.headers or {},  # SSE 서버를 위한 headers 필드 추가
             'disabled': not server.is_enabled
         }
     except Exception as e:
