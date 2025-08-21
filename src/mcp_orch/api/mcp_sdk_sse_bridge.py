@@ -719,8 +719,46 @@ async def run_mcp_bridge_session(
                         }
                     # SSE 브리지 테스트 도구가 아닌 경우
                     else:
+                        # transport type 확인
+                        transport_type = server_config.get('transportType', 'stdio')
+                        
+                        # SSE 서버의 경우
+                        if transport_type == 'sse' or server_record.transport_type == 'sse':
+                            logger.info(f"🔄 Proxying tool call to SSE backend: {name}")
+                            
+                            try:
+                                from ..core.sse_server import SSEMCPServer, SSEServerConfig
+                                
+                                # SSE 서버 설정 생성
+                                sse_config = SSEServerConfig(
+                                    name=server_name,
+                                    url=server_config.get('url', ''),
+                                    headers=server_config.get('headers', {}),
+                                    timeout=server_config.get('timeout', 30),
+                                    disabled=not server_config.get('is_enabled', True)
+                                )
+                                
+                                # SSE 서버 인스턴스 생성 및 연결
+                                sse_server = SSEMCPServer(sse_config)
+                                await sse_server.start(skip_initialization=False)
+                                
+                                # SSE 서버로 도구 호출
+                                result = await sse_server.call_tool(name, arguments)
+                                
+                                # SSE 서버 연결 종료
+                                await sse_server.stop()
+                                
+                                logger.info(f"✅ Tool call result from SSE backend: {result}")
+                                
+                            except Exception as sse_error:
+                                logger.error(f"❌ Failed to call SSE tool {name}: {sse_error}", exc_info=True)
+                                result = {
+                                    "status": "error",
+                                    "message": f"Failed to call SSE tool: {str(sse_error)}"
+                                }
+                        
                         # stdio 백엔드가 있는 경우 프록시
-                        if server_config.get('command'):
+                        elif server_config.get('command'):
                             logger.info(f"🔄 Proxying tool call to stdio backend: {name}")
                             
                             from ..services.mcp_connection_service import mcp_connection_service
