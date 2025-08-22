@@ -120,26 +120,33 @@ class McpSessionManager:
         """
         if '.' in server_id:
             try:
-                project_id_str, server_name = server_id.split('.', 1)
+                project_id_str, server_id_or_name = server_id.split('.', 1)
                 project_id = UUID(project_id_str)
                 
-                # DB에서 실제 서버 ID 조회
-                from ..database import get_db
-                from ..models import McpServer
-                db = next(get_db())
+                # server_id_or_name이 UUID인지 확인
                 try:
-                    server = db.query(McpServer).filter(
-                        McpServer.project_id == project_id,
-                        McpServer.name == server_name
-                    ).first()
-                    if server:
-                        logger.debug(f"Resolved server_id {server_id} to project={project_id}, server={server.id}")
-                        return project_id, server.id
-                    else:
-                        logger.warning(f"Server not found for {server_id}")
-                        return project_id, None
-                finally:
-                    db.close()
+                    # UUID 형식이면 그대로 사용
+                    actual_server_id = UUID(server_id_or_name)
+                    logger.debug(f"Resolved server_id {server_id} to project={project_id}, server={actual_server_id}")
+                    return project_id, actual_server_id
+                except ValueError:
+                    # UUID가 아니면 서버 이름으로 간주하고 DB 조회
+                    from ..database import get_db
+                    from ..models import McpServer
+                    db = next(get_db())
+                    try:
+                        server = db.query(McpServer).filter(
+                            McpServer.project_id == project_id,
+                            McpServer.name == server_id_or_name
+                        ).first()
+                        if server:
+                            logger.debug(f"Resolved server_id {server_id} to project={project_id}, server={server.id}")
+                            return project_id, server.id
+                        else:
+                            logger.warning(f"Server not found for {server_id}")
+                            return project_id, None
+                    finally:
+                        db.close()
             except (ValueError, TypeError) as e:
                 logger.warning(f"Failed to parse server_id format {server_id}: {e}")
                 return None, None
@@ -161,9 +168,13 @@ class McpSessionManager:
     
     async def get_or_create_session(self, server_id: str, server_config: Dict) -> McpSession:
         """서버 세션을 가져오거나 새로 생성 (MCP 표준 패턴)"""
+        # project_id를 포함한 고유 세션 키 생성
+        # server_id가 이미 project_id를 포함하고 있을 수 있음 (예: "project_id.server_id" 형식)
+        session_key = server_id
+        
         # 기존 세션이 있고 유효한지 확인
-        if server_id in self.sessions:
-            session = self.sessions[server_id]
+        if session_key in self.sessions:
+            session = self.sessions[session_key]
             
             # 세션이 살아있는지 확인
             if await self._is_session_alive(session):
@@ -174,11 +185,11 @@ class McpSessionManager:
                 # 죽은 세션 정리
                 logger.warning(f"⚠️ Session for server {server_id} is dead, creating new one")
                 await self._close_session(session)
-                del self.sessions[server_id]
+                del self.sessions[session_key]
         
         # 새 세션 생성 (MCP stdio_client 패턴)
         session = await self._create_new_session(server_id, server_config)
-        self.sessions[server_id] = session
+        self.sessions[session_key] = session
         logger.info(f"🆕 Created new session for server {server_id}")
         return session
     
@@ -676,16 +687,21 @@ class McpSessionManager:
                 tools = sse_server.tools
                 logger.info(f"✅ Retrieved {len(tools)} tools from SSE server {server_id}")
                 
-                # 🆕 project_id 우선 사용: API에서 전달된 project_id가 있으면 우선 사용
-                if project_id:
-                    # API에서 project_id가 전달된 경우 (외부 SSE 서버)
+                # 🆕 server_id 해석 - project_id.server_id 형식 처리
+                resolved_project_id, actual_server_id = self._resolve_server_id(server_id)
+                
+                # API에서 전달된 project_id가 있으면 우선 사용
+                if project_id and not resolved_project_id:
                     resolved_project_id = project_id
-                    actual_server_id = UUID(server_id) if isinstance(server_id, str) else server_id
-                    logger.info(f"🔍 [DEBUG] Using provided project_id for SSE server: project_id={resolved_project_id}, server_id={actual_server_id}")
-                else:
-                    # 기존 server_id 해석 로직 사용 (내부 브리지 서버)
-                    resolved_project_id, actual_server_id = self._resolve_server_id(server_id)
-                    logger.info(f"🔍 [DEBUG] Resolved from server_id: {server_id} -> project_id={resolved_project_id}, actual_server_id={actual_server_id}")
+                    # server_id가 단순 UUID 문자열인 경우에만 변환
+                    try:
+                        actual_server_id = UUID(server_id) if isinstance(server_id, str) else server_id
+                    except ValueError:
+                        # UUID 변환 실패 시 그대로 사용
+                        actual_server_id = server_id
+                    logger.info(f"🔍 [DEBUG] Using API-provided project_id for SSE: {resolved_project_id}")
+                
+                logger.info(f"🔍 [DEBUG] Final IDs for SSE server - project_id={resolved_project_id}, server_id={actual_server_id}")
                 
                 # 🆕 도구 필터링 적용
                 filtered_tools = tools
@@ -722,16 +738,16 @@ class McpSessionManager:
             # 세션 초기화 (필요시)
             await self.initialize_session(session)
             
-            # 🆕 project_id 우선 사용: API에서 전달된 project_id가 있으면 우선 사용
-            if project_id:
-                # API에서 project_id가 전달된 경우
+            # 🆕 server_id 해석 - project_id.server_id 형식 처리
+            # server_id가 이미 project_id.server_id 형식일 수 있음
+            resolved_project_id, actual_server_id = self._resolve_server_id(server_id)
+            
+            # API에서 전달된 project_id가 있으면 우선 사용
+            if project_id and not resolved_project_id:
                 resolved_project_id = project_id
-                actual_server_id = UUID(server_id) if isinstance(server_id, str) else server_id
-                logger.info(f"🔍 [DEBUG] Using provided project_id for stdio server: project_id={resolved_project_id}, server_id={actual_server_id}")
-            else:
-                # 기존 server_id 해석 로직 사용
-                resolved_project_id, actual_server_id = self._resolve_server_id(server_id)
-                logger.info(f"🔍 [DEBUG] Resolved from server_id: {server_id} -> project_id={resolved_project_id}, actual_server_id={actual_server_id}")
+                logger.info(f"🔍 [DEBUG] Using API-provided project_id: {resolved_project_id}")
+            
+            logger.info(f"🔍 [DEBUG] Final IDs for stdio server - project_id={resolved_project_id}, server_id={actual_server_id}, original={server_id}")
             
             # 캐시된 도구 목록이 있으면 필터링 후 반환
             if session.tools_cache is not None:

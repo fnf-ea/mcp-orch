@@ -228,7 +228,7 @@ class MCPSSETransport:
                     "name": f"mcp-orch-{self.server.name}",
                     "version": "1.0.0"
                 },
-                "instructions": f"MCP Orchestrator proxy for '{self.server.name}' in project {self.project_id}. Use tools/list to see available tools."
+                "instructions": f"MCP Orchestrator proxy for '{self.server.name}' in project {self.project_id}."
             }
         }
         

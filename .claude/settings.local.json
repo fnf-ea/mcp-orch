@@ -24,7 +24,12 @@
       "Bash(uv pip:*)",
       "WebFetch(domain:github.com)",
       "mcp__serena__think_about_collected_information",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(cat:*)",
+      "Bash(psql:*)",
+      "Bash(export DATABASE_URL=\"postgresql://postgres:1234@localhost:5432/mcp_orch\")",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)"
     ],
     "deny": []
   },

@@ -154,7 +154,11 @@ class McpOrchestrator:
                 except (ValueError, TypeError):
                     logger.warning(f"Invalid project_id format: {project_id}")
             
-            return await session_manager.get_server_tools(server_id, server_config, project_id=project_uuid)
+            # Create session key with project context
+            session_key = f"{project_uuid}.{server_id}" if project_uuid else server_id
+            logger.debug(f"Getting tools with session key: {session_key}")
+            
+            return await session_manager.get_server_tools(session_key, server_config, project_id=project_uuid)
                 
         except Exception as e:
             logger.error(f"❌ Error getting tools for server {server_id}: {e}")
@@ -188,10 +192,24 @@ class McpOrchestrator:
             # For now, delegate to session manager to maintain compatibility
             # TODO: Gradually migrate this to use tool_executor + connection_manager
             from ..mcp_session_manager import get_session_manager
+            from uuid import UUID
             
             session_manager = await get_session_manager()
+            
+            # Convert project_id to UUID if needed
+            project_uuid = None
+            if project_id:
+                try:
+                    project_uuid = UUID(project_id) if isinstance(project_id, str) else project_id
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid project_id format: {project_id}")
+            
+            # Create session key with project context
+            session_key = f"{project_uuid}.{server_id}" if project_uuid else server_id
+            logger.debug(f"Calling tool with session key: {session_key}")
+            
             return await session_manager.call_tool(
-                server_id=server_id,
+                server_id=session_key,
                 server_config=server_config,
                 tool_name=tool_name,
                 arguments=arguments,

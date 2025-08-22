@@ -795,7 +795,7 @@ async def handle_individual_initialize(message: dict, project_id: UUID, server_n
                 "name": f"mcp-orch-{server_name}",
                 "version": "1.0.0"
             },
-            "instructions": f"Individual MCP server '{server_name}' in project {project_id}. Use tools/list to see available tools."
+            "instructions": f"Individual MCP server '{server_name}' in project {project_id}."
         }
     }
     
