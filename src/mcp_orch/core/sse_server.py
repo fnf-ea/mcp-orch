@@ -382,9 +382,8 @@ class SSEMCPServer:
         if not self.is_connected:
             raise RuntimeError(f"SSE MCP server {self.config.name} is not connected")
             
-        # auto_approve 확인
-        if tool_name not in self.config.auto_approve:
-            logger.warning(f"Tool {tool_name} requires approval but auto_approve not set")
+        # auto_approve 체크 제거 - SSE 브릿지에서는 항상 실행
+        # logger.debug(f"Calling tool {tool_name} without approval check")
         
         return await self._send_request("tools/call", {
             "name": tool_name,

@@ -65,7 +65,7 @@ class UnifiedProtocolHandler:
                     "name": f"mcp-orch-unified",
                     "version": "1.9.4"
                 },
-                "instructions": f"MCP Orchestrator unified proxy for project {self.transport.project_id}. Use tools/list to see available tools."
+                "instructions": f"MCP Orchestrator unified proxy for project {self.transport.project_id}."
             }
         }
         
@@ -194,8 +194,19 @@ class UnifiedProtocolHandler:
         
         # Parse namespace and route to server
         try:
-            # parse_tool_name returns a tuple (server_name, original_name)
-            server_name, original_name = self.transport.tool_naming.parse_tool_name(tool_name)
+            # Check if tool name is namespaced
+            if self.transport.tool_naming.is_namespaced(tool_name):
+                # parse_tool_name returns a tuple (server_name, original_name)
+                server_name, original_name = self.transport.tool_naming.parse_tool_name(tool_name)
+            else:
+                # For non-namespaced tools, try to find which server provides it
+                # This is useful for single-server scenarios or when client doesn't use namespace
+                server_name = await self._find_server_for_tool(tool_name)
+                if not server_name:
+                    # If no server found, raise error
+                    raise ValueError(f"No server provides tool '{tool_name}'")
+                original_name = tool_name
+                logger.info(f"Auto-resolved tool '{tool_name}' to server '{server_name}'")
         except (ValueError, TypeError) as e:
             logger.error(f"Failed to parse tool name '{tool_name}': {e}")
             error_response = {
@@ -383,6 +394,52 @@ class UnifiedProtocolHandler:
         
         return processed_tool
     
+    
+    async def _find_server_for_tool(self, tool_name: str) -> Optional[str]:
+        """
+        Find which server provides a specific tool.
+        
+        This is useful for single-server scenarios or when clients don't use namespaces.
+        
+        Args:
+            tool_name: The non-namespaced tool name to search for
+            
+        Returns:
+            Server name if found, None otherwise
+        """
+        active_servers = [s for s in self.transport.project_servers if s.is_enabled]
+        
+        logger.info(f"🔍 Searching for tool '{tool_name}' across {len(active_servers)} servers")
+        
+        for server in active_servers:
+            try:
+                # Check if server is available
+                if not self.transport._is_server_available(server.name):
+                    continue
+                    
+                # Build server config
+                server_config = self.transport._build_server_config_for_server(server)
+                if not server_config:
+                    continue
+                    
+                # Get tools from server
+                tools = await mcp_connection_service.get_server_tools(
+                    str(server.id), server_config, project_id=str(self.transport.project_id)
+                )
+                
+                if tools:
+                    # Check if this server has the requested tool
+                    for tool in tools:
+                        if tool.get('name') == tool_name:
+                            logger.info(f"✅ Found tool '{tool_name}' in server '{server.name}'")
+                            return server.name
+                            
+            except Exception as e:
+                logger.debug(f"Error checking server {server.name} for tool {tool_name}: {e}")
+                continue
+        
+        logger.warning(f"❌ Tool '{tool_name}' not found in any server")
+        return None
     
     async def _execute_tool_on_server(self, server_name: str, tool_name: str, arguments: Dict[str, Any]) -> Any:
         """Execute tool on specific server"""

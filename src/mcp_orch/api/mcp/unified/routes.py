@@ -64,7 +64,7 @@ async def handle_initialize_request(message: dict, project_id: UUID, sessionId: 
                 "name": f"mcp-orch-unified-{project_id}",
                 "version": "1.0.0"
             },
-            "instructions": f"Unified MCP server for project {project_id} with {len(project_servers)} active servers. Use tools/list to see available tools."
+            "instructions": f"Unified MCP server for project {project_id} with {len(project_servers)} active servers."
         }
     }
     
